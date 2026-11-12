@@ -191,7 +191,7 @@ pub(crate) fn rename(
                     source_change.extend(usages.references.get_mut(&file_id).iter().map(|refs| {
                         (
                             position.file_id,
-                            source_edit_from_references(db, refs, def, &new_name, edition),
+                            source_edit_from_references(db, file_id, refs, def, &new_name, edition),
                         )
                     }));
 
@@ -559,6 +559,7 @@ fn rename_to_self<'db>(
             file_id.file_id(sema.db),
             source_edit_from_references(
                 sema.db,
+                file_id,
                 references,
                 def,
                 &Name::new_symbol_root(sym::self_),
@@ -789,6 +790,7 @@ fn rename_self_to_param<'db>(
             file_id.file_id(sema.db),
             source_edit_from_references(
                 sema.db,
+                file_id,
                 references,
                 def,
                 new_name,
@@ -4167,6 +4169,200 @@ pub fn main() {
         }
         None => {}
     }
+}
+"#,
+        );
+    }
+    #[test]
+    fn test_rename_field_in_field_shorthand_in_macro() {
+        cov_mark::check!(test_rename_field_in_field_shorthand_in_macro);
+        check(
+            "new_name",
+            r#"
+struct Foo {
+    abc$0: u32,
+}
+
+macro_rules! my_macro {
+    ($x:expr) => {
+        $x
+    };
+}
+
+pub fn main() {
+    let abc: u32 = 0;
+    let x = my_macro!(Foo { abc });
+}
+"#,
+            r#"
+struct Foo {
+    new_name: u32,
+}
+
+macro_rules! my_macro {
+    ($x:expr) => {
+        $x
+    };
+}
+
+pub fn main() {
+    let abc: u32 = 0;
+    let x = my_macro!(Foo { new_name: abc });
+}
+"#,
+        );
+    }
+    #[test]
+    fn test_rename_local_in_field_shorthand_in_macro() {
+        cov_mark::check!(test_rename_local_in_field_shorthand_in_macro);
+        check(
+            "new_name",
+            r#"
+struct Foo {
+    abc: u32,
+}
+
+macro_rules! my_macro {
+    ($x:expr) => {
+        $x
+    };
+}
+
+pub fn main() {
+    let abc$0: u32 = 0;
+    let y = Foo { abc };
+    let x = my_macro!(Foo { abc });
+}
+"#,
+            r#"
+struct Foo {
+    abc: u32,
+}
+
+macro_rules! my_macro {
+    ($x:expr) => {
+        $x
+    };
+}
+
+pub fn main() {
+    let new_name: u32 = 0;
+    let y = Foo { abc: new_name };
+    let x = my_macro!(Foo { abc: new_name });
+}
+"#,
+        );
+    }
+    #[test]
+    fn test_rename_field_in_field_shorthand_in_macro_multiple_mappings() {
+        check(
+            "new_name",
+            r#"
+struct Foo {
+    abc$0: u32,
+}
+
+macro_rules! my_macro {
+    ($x:expr) => {
+        { $x; $x; }
+    };
+}
+
+pub fn main() {
+    let abc: u32 = 0;
+    let x = my_macro!(Foo { abc });
+}
+"#,
+            r#"
+struct Foo {
+    new_name: u32,
+}
+
+macro_rules! my_macro {
+    ($x:expr) => {
+        { $x; $x; }
+    };
+}
+
+pub fn main() {
+    let abc: u32 = 0;
+    let x = my_macro!(Foo { new_name: abc });
+}
+"#,
+        );
+    }
+    #[test]
+    fn test_rename_local_in_macro_generated_shorthand() {
+        check(
+            "new_name",
+            r#"
+struct Foo {
+    abc: u32,
+}
+
+macro_rules! shorthand {
+    ($i:ident) => {
+        Foo { $i }
+    };
+}
+
+pub fn main() {
+    let abc$0: u32 = 0;
+    let x = shorthand!(abc);
+}
+"#,
+            r#"
+struct Foo {
+    abc: u32,
+}
+
+macro_rules! shorthand {
+    ($i:ident) => {
+        Foo { $i }
+    };
+}
+
+pub fn main() {
+    let new_name: u32 = 0;
+    let x = shorthand!(new_name);
+}
+"#,
+        );
+    }
+    #[test]
+    fn test_rename_field_in_macro_generated_shorthand() {
+        check(
+            "new_name",
+            r#"
+struct Foo {
+    abc$0: u32,
+}
+
+macro_rules! shorthand {
+    ($i:ident) => {
+        Foo { $i }
+    };
+}
+
+pub fn main() {
+    let abc: u32 = 0;
+    let x = shorthand!(abc);
+}
+"#,
+            r#"
+struct Foo {
+    new_name: u32,
+}
+
+macro_rules! shorthand {
+    ($i:ident) => {
+        Foo { $i }
+    };
+}
+
+pub fn main() {
+    let abc: u32 = 0;
+    let x = shorthand!(new_name);
 }
 "#,
         );
