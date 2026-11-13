@@ -481,6 +481,18 @@ impl Server {
         }
     }
 
+    /// Waits until `check` succeeds, giving the server time to pick up file
+    /// system changes.
+    pub(crate) fn wait_for_vfs_change(&self, check: impl Fn() -> bool) {
+        for _ in 0..120 {
+            if check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        panic!("timed out waiting for the server to reflect a file system change");
+    }
+
     fn wait_for_message_cond(
         &self,
         n: usize,

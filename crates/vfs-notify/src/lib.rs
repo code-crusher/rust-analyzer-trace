@@ -14,7 +14,10 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::AccessKind};
+use notify::{
+    Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{AccessKind, ModifyKind, RenameMode},
+};
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use rayon::iter::{IndexedParallelIterator as _, IntoParallelIterator as _, ParallelIterator};
 use rustc_hash::FxHashSet;
@@ -191,7 +194,7 @@ impl NotifyActor {
                         });
                     }
                     Message::Invalidate(path) => {
-                        let contents = read(path.as_path());
+                        let contents = read_exactly_named(path.as_path());
                         let files = vec![(path, contents)];
                         self.send(loader::Message::Changed { files });
                     }
@@ -203,19 +206,21 @@ impl NotifyActor {
                         | EventKind::Remove(_)
                         | EventKind::Access(AccessKind::Open(_)) = event.kind
                     {
-                        let abs_paths: Vec<AbsPathBuf> = event
+                        let abs_paths: Vec<(usize, AbsPathBuf)> = event
                             .paths
                             .into_iter()
-                            .filter_map(|path| {
-                                Some(
+                            .enumerate()
+                            .filter_map(|(idx, path)| {
+                                Some((
+                                    idx,
                                     AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path).ok()?)
                                         .expect("path is absolute"),
-                                )
+                                ))
                             })
                             .collect();
 
                         let mut saw_new_file = false;
-                        for abs_path in &abs_paths {
+                        for (_, abs_path) in &abs_paths {
                             if self.seen_paths.insert(abs_path.clone()) {
                                 saw_new_file = true;
                             }
@@ -232,42 +237,15 @@ impl NotifyActor {
                             continue;
                         }
 
+                        let rename_mode = match event.kind {
+                            EventKind::Modify(ModifyKind::Name(rename_mode)) => Some(rename_mode),
+                            _ => None,
+                        };
+
                         let files = abs_paths
                             .into_iter()
-                            .filter_map(|path| -> Option<(AbsPathBuf, Option<Vec<u8>>)> {
-                                // Ignore events for files/directories that we're not watching.
-                                if !(self.watched_file_entries.contains(&path)
-                                    || self
-                                        .watched_dir_entries
-                                        .iter()
-                                        .any(|dir| dir.contains_file(&path)))
-                                {
-                                    return None;
-                                }
-
-                                // For removed files, fs::metadata() will return Err, but
-                                // we still want to update the VFS.
-                                if matches!(event.kind, EventKind::Remove(_)) {
-                                    return Some((path, None));
-                                }
-
-                                let meta = fs::metadata(&path).ok()?;
-                                if meta.file_type().is_dir()
-                                    && self
-                                        .watched_dir_entries
-                                        .iter()
-                                        .any(|dir| dir.contains_dir(&path))
-                                {
-                                    self.watch(path.as_ref());
-                                    return None;
-                                }
-
-                                if !meta.file_type().is_file() {
-                                    return None;
-                                }
-
-                                let contents = read(&path);
-                                Some((path, contents))
+                            .filter_map(|(idx, path)| {
+                                self.file_change(rename_mode, idx, &event.kind, path)
                             })
                             .collect();
                         self.send(loader::Message::Changed { files });
@@ -352,6 +330,58 @@ impl NotifyActor {
         }
     }
 
+    /// Determines the VFS update for the `idx`-th path of a watcher event.
+    ///
+    /// The old path of a rename no longer exists, so it is always reported as
+    /// deleted. This matters on case-insensitive filesystems, where the old
+    /// path of a case-only rename (e.g. `Test1.rs` -> `test1.rs`) still reads
+    /// successfully, since it refers to the same file. Reporting its contents
+    /// would resurrect a stale VFS entry under a path that no longer matches
+    /// any directory entry.
+    fn file_change(
+        &mut self,
+        rename_mode: Option<RenameMode>,
+        idx: usize,
+        kind: &EventKind,
+        path: AbsPathBuf,
+    ) -> Option<(AbsPathBuf, Option<Vec<u8>>)> {
+        // Ignore events for files/directories that we're not watching.
+        if !(self.watched_file_entries.contains(&path)
+            || self.watched_dir_entries.iter().any(|dir| dir.contains_file(&path)))
+        {
+            return None;
+        }
+
+        // For removed files, fs::metadata() will return Err, but
+        // we still want to update the VFS.
+        if matches!(kind, EventKind::Remove(_)) {
+            return Some((path, None));
+        }
+
+        // The first path of a `Both` rename event (and the only path of a
+        // `From` event) is the old name, which is gone after the rename.
+        match rename_mode {
+            Some(RenameMode::From) => return Some((path, None)),
+            Some(RenameMode::Both) if idx == 0 => return Some((path, None)),
+            _ => {}
+        }
+
+        let meta = fs::metadata(&path).ok()?;
+        if meta.file_type().is_dir()
+            && self.watched_dir_entries.iter().any(|dir| dir.contains_dir(&path))
+        {
+            self.watch(path.as_ref());
+            return None;
+        }
+
+        if !meta.file_type().is_file() {
+            return None;
+        }
+
+        let contents = read_exactly_named(&path);
+        Some((path, contents))
+    }
+
     fn watch(&mut self, path: &Path) {
         if let Some((watcher, _)) = &mut self.watcher {
             log_notify_error(watcher.watch(path, RecursiveMode::Recursive));
@@ -366,6 +396,27 @@ impl NotifyActor {
 
 fn read(path: &AbsPath) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
+}
+
+/// Like [`read`], but additionally requires the file to exist under exactly
+/// this name, see [`file_change`].
+///
+/// On case-insensitive filesystems, reading a path whose name only differs in
+/// case from an existing file (e.g. `Test1.rs` vs `test1.rs`) succeeds. VFS
+/// paths are compared case-sensitively, so reporting such a read as a file
+/// under the requested name would create a VFS entry for a path that matches
+/// no directory entry, and the entry could never be cleaned up by re-reading
+/// the disk. Treat such paths as missing instead.
+fn read_exactly_named(path: &AbsPath) -> Option<Vec<u8>> {
+    let contents = read(path)?;
+
+    let Some(file_name) = path.file_name() else { return Some(contents) };
+    let Some(parent) = path.parent() else { return Some(contents) };
+    let Ok(entries) = fs::read_dir(parent) else { return Some(contents) };
+
+    let exists_under_this_name =
+        entries.filter_map(Result::ok).any(|entry| entry.file_name() == file_name);
+    exists_under_this_name.then_some(contents)
 }
 
 fn log_notify_error<T>(res: notify::Result<T>) -> Option<T> {
@@ -388,4 +439,111 @@ fn path_might_be_cyclic(path: &Path) -> bool {
         destination.components().all(|c| matches!(c, Component::CurDir | Component::ParentDir));
 
     is_relative_parent || path.starts_with(destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use notify::event::{ModifyKind, RenameMode};
+    use paths::AbsPathBuf;
+    use vfs::loader::Directories;
+
+    use super::*;
+
+    /// A temporary directory with a watched `foo.rs` file, for driving
+    /// [`NotifyActor::file_change`] directly.
+    struct TempDir {
+        path: AbsPathBuf,
+    }
+
+    impl TempDir {
+        fn new(test_name: &str) -> TempDir {
+            let path = std::env::temp_dir().join(format!(
+                "rust-analyzer-vfs-notify-{}-{}",
+                std::process::id(),
+                test_name,
+            ));
+            _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            let path = Utf8PathBuf::from_path_buf(path).unwrap();
+            let path = AbsPathBuf::try_from(path).unwrap();
+            TempDir { path }
+        }
+
+        fn write(&self, file_name: &str, contents: &str) -> AbsPathBuf {
+            let path = self.path.join(file_name);
+            fs::write(&path, contents).unwrap();
+            path
+        }
+
+        /// An actor watching the whole temporary directory for `rs` files.
+        fn actor(&self) -> NotifyActor {
+            let (sender, _) = crossbeam_channel::unbounded();
+            let mut actor = NotifyActor::new(sender);
+            actor.watched_dir_entries.push(Directories {
+                extensions: vec!["rs".to_owned()],
+                include: vec![self.path.clone()],
+                exclude: Vec::new(),
+            });
+            actor
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// The old path of a rename event is reported as deleted, even if it is
+    /// still readable. On case-insensitive filesystems this is what happens
+    /// after a case-only rename like `Test1.rs` -> `test1.rs`, and reporting
+    /// the old path's contents would resurrect a stale VFS entry.
+    #[test]
+    fn rename_event_old_path_is_reported_as_deleted() {
+        let tmp = TempDir::new("rename_event_old_path_is_reported_as_deleted");
+        let old_path = tmp.write("foo.rs", "fn foo() {}");
+        let mut actor = tmp.actor();
+
+        let change =
+            actor.file_change(Some(RenameMode::Both), 0, &rename_event_kind(), old_path.clone());
+        assert_eq!(change, Some((old_path.clone(), None)));
+
+        let change =
+            actor.file_change(Some(RenameMode::From), 0, &rename_event_kind(), old_path.clone());
+        assert_eq!(change, Some((old_path, None)));
+    }
+
+    /// The new path of a rename event is read as usual.
+    #[test]
+    fn rename_event_new_path_is_read() {
+        let tmp = TempDir::new("rename_event_new_path_is_read");
+        let new_path = tmp.write("bar.rs", "fn bar() {}");
+        let mut actor = tmp.actor();
+
+        let change =
+            actor.file_change(Some(RenameMode::Both), 1, &rename_event_kind(), new_path.clone());
+        assert_eq!(change, Some((new_path, Some(b"fn bar() {}".to_vec()))));
+    }
+
+    /// Files are only picked up under the exact name they are stored under,
+    /// even on case-insensitive filesystems, where reading e.g. `Foo.rs`
+    /// succeeds while the file is actually named `foo.rs`.
+    #[test]
+    fn reads_require_the_exact_file_name() {
+        let tmp = TempDir::new("reads_require_the_exact_file_name");
+        let exact = tmp.write("foo.rs", "fn foo() {}");
+        let case_flipped = tmp.path.join("Foo.rs");
+
+        // On case-sensitive filesystems reading the flipped name fails
+        // outright, on case-insensitive ones it succeeds; either way it must
+        // not be reported as an existing file.
+        assert!(read_exactly_named(&case_flipped).is_none());
+        assert_eq!(read_exactly_named(&exact), Some(b"fn foo() {}".to_vec()));
+    }
+
+    fn rename_event_kind() -> EventKind {
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+    }
 }

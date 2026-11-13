@@ -33,7 +33,7 @@ use lsp_types::{
     SemanticTokensParams, SemanticTokensRequest, TextDocumentContentChangeEvent,
     TextDocumentContentChangeWholeDocument, TextDocumentItem, TextDocumentPositionParams,
     TypeDefinitionParams, TypeDefinitionRequest, Uri, VersionedTextDocumentIdentifier,
-    WillRenameFilesRequest, WorkDoneProgressParams, WorkspaceSymbolRequest,
+    WillRenameFilesRequest, WorkDoneProgressParams, WorkspaceSymbolParams, WorkspaceSymbolRequest,
 };
 use rust_analyzer::lsp::ext::{OnEnterRequest, RunnablesParams, RunnablesRequest};
 use serde_json::json;
@@ -1482,6 +1482,83 @@ use crate::old_folder::nested::foo as bar;
           ]
         }),
     );
+}
+
+/// Renaming a module file on disk must not leave the old path in the VFS as a
+/// stale, still-resolvable file.
+///
+/// This is a regression test for the case where the old path of the rename
+/// stays readable (on case-insensitive filesystems, a case-only rename like
+/// `Test1.rs` -> `test1.rs`, as produced by the `Rename to \`test1\`` quick
+/// fix) and resurrected the deleted file, so `mod Test1;` kept resolving
+/// while the actual, renamed file was not part of the module tree.
+///
+/// See https://github.com/rust-lang/rust-analyzer/issues/23466.
+#[test]
+fn renamed_module_file_is_removed_from_vfs() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let tmp_dir = TestDir::new();
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+mod Test1;
+
+//- /src/Test1.rs
+pub struct Foo;
+"#,
+    )
+    .tmp_dir(tmp_dir)
+    .with_config(serde_json::json!({
+        "files": { "watcher": "server" },
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    // `Foo` is part of the module tree, as `mod Test1;` resolves to
+    // `Test1.rs`.
+    let res = server.send_request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+        query: "Foo".to_owned(),
+        partial_result_params: PartialResultParams::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    assert!(res.to_string().contains("Foo"));
+
+    // Rename the module file, as the rename quick fix or the user would.
+    std::fs::rename(server.path().join("src/Test1.rs"), server.path().join("src/test1.rs"))
+        .unwrap();
+
+    // Wait for the server to process the rename, then check that the old file
+    // is gone: `Foo` must not be found anymore, since `mod Test1;` can no
+    // longer resolve (the declaration still has the old name).
+    server.wait_for_vfs_change(|| {
+        let res = server.send_request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+            query: "Foo".to_owned(),
+            partial_result_params: PartialResultParams::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+        !res.to_string().contains("Foo")
+    });
+
+    // After fixing up the declaration, the renamed file must be picked up.
+    server.write_file_and_save("src/lib.rs", "mod test1;\n".to_owned());
+    server.write_file_and_save("src/test1.rs", "pub struct Foo;\n".to_owned());
+
+    server.wait_for_vfs_change(|| {
+        let res = server.send_request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+            query: "Foo".to_owned(),
+            partial_result_params: PartialResultParams::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        });
+        res.to_string().contains("Foo")
+    });
 }
 
 #[test]
