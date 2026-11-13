@@ -69,8 +69,9 @@ fn check_number(#[rust_analyzer::rust_fixture] ra_fixture: &str, answer: i128) {
 #[track_caller]
 fn check_str(#[rust_analyzer::rust_fixture] ra_fixture: &str, answer: &str) {
     check_answer(ra_fixture, |b, mm| {
-        let addr = usize::from_le_bytes(b[0..b.len() / 2].try_into().unwrap());
-        let size = usize::from_le_bytes(b[b.len() / 2..].try_into().unwrap());
+        let ptr_size = b.len() / 2;
+        let addr = u128::from_le_bytes(pad16(&b[..ptr_size], IsSigned::No)) as usize;
+        let size = u128::from_le_bytes(pad16(&b[ptr_size..], IsSigned::No)) as usize;
         let Some(bytes) = mm.get(addr, size) else {
             panic!("string data missed in the memory map");
         };
@@ -3010,5 +3011,38 @@ fn uninhabited_enum_discriminant_read() {
     };
     "#,
         |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
+    );
+}
+
+#[test]
+fn non_host_pointer_size() {
+    // Regression test for #23480: const evaluation used to be disabled entirely for targets whose
+    // pointer size differs from the host's (e.g. a 32-bit target on a 64-bit machine).
+    let fixture = r#"
+//- target_data_layout: e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64
+//- target_arch: other
+//- minicore: coerce_unsized, index, slice
+const GOAL: usize = 1 + 1;
+"#;
+    check_number(fixture, 2);
+
+    check_number(
+        r#"
+//- target_data_layout: e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64
+//- target_arch: other
+//- minicore: sized
+const GOAL: usize = 12 as *const i32 as usize;
+"#,
+        12,
+    );
+
+    check_str(
+        r#"
+//- target_data_layout: e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64
+//- target_arch: other
+//- minicore: coerce_unsized, index, slice
+const GOAL: &str = "hello";
+"#,
+        "hello",
     );
 }

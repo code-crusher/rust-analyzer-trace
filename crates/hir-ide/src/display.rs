@@ -825,6 +825,11 @@ fn render_const_scalar_inner<'db>(
 ) -> Result {
     use TyKind;
     let param_env = ParamEnvAndCrate { param_env, krate: f.krate() };
+    let ptr_size = f
+        .db
+        .target_data_layout(f.krate())
+        .map(|it| it.pointer_size().bytes_usize())
+        .unwrap_or(size_of::<usize>());
     match ty.kind() {
         TyKind::Bool => write!(f, "{}", b[0] != 0),
         TyKind::Char => {
@@ -876,8 +881,12 @@ fn render_const_scalar_inner<'db>(
         },
         TyKind::Ref(_, t, _) => match t.kind() {
             TyKind::Str => {
-                let addr = usize::from_le_bytes(b[0..b.len() / 2].try_into().unwrap());
-                let size = usize::from_le_bytes(b[b.len() / 2..].try_into().unwrap());
+                let Some((addr, size)) = b.split_at_checked(ptr_size) else {
+                    never!("`str` reference with incorrect byte count {}", b.len());
+                    return f.write_str("<layout-error>");
+                };
+                let addr = u128::from_le_bytes(pad16(addr, IsSigned::No)) as usize;
+                let size = u128::from_le_bytes(pad16(size, IsSigned::No)) as usize;
                 let Some(bytes) = memory_map.get(addr, size) else {
                     return f.write_str("<ref-data-not-available>");
                 };
@@ -885,8 +894,12 @@ fn render_const_scalar_inner<'db>(
                 write!(f, "{s:?}")
             }
             TyKind::Slice(ty) => {
-                let addr = usize::from_le_bytes(b[0..b.len() / 2].try_into().unwrap());
-                let count = usize::from_le_bytes(b[b.len() / 2..].try_into().unwrap());
+                let Some((addr, count)) = b.split_at_checked(ptr_size) else {
+                    never!("slice reference with incorrect byte count {}", b.len());
+                    return f.write_str("<layout-error>");
+                };
+                let addr = u128::from_le_bytes(pad16(addr, IsSigned::No)) as usize;
+                let count = u128::from_le_bytes(pad16(count, IsSigned::No)) as usize;
                 let Ok(layout) = f.db.layout_of_ty(ty.store(), param_env.store()) else {
                     return f.write_str("<layout-error>");
                 };
@@ -916,8 +929,12 @@ fn render_const_scalar_inner<'db>(
                 f.write_str("]")
             }
             TyKind::Dynamic(_, _) => {
-                let addr = usize::from_le_bytes(b[0..b.len() / 2].try_into().unwrap());
-                let ty_id = usize::from_le_bytes(b[b.len() / 2..].try_into().unwrap());
+                let Some((addr, ty_id)) = b.split_at_checked(ptr_size) else {
+                    never!("`dyn` reference with incorrect byte count {}", b.len());
+                    return f.write_str("<layout-error>");
+                };
+                let addr = u128::from_le_bytes(pad16(addr, IsSigned::No)) as usize;
+                let ty_id = u128::from_le_bytes(pad16(ty_id, IsSigned::No)) as usize;
                 let Ok(t) = memory_map.vtable_ty(ty_id) else {
                     return f.write_str("<ty-missing-in-vtable-map>");
                 };
@@ -931,7 +948,7 @@ fn render_const_scalar_inner<'db>(
                 f.write_str("&")?;
                 render_const_scalar(f, bytes, memory_map, t)
             }
-            TyKind::Adt(adt, _) if b.len() == 2 * size_of::<usize>() => match adt.def_id() {
+            TyKind::Adt(adt, _) if b.len() == 2 * ptr_size => match adt.def_id() {
                 hir_def::AdtId::StructId(s) => {
                     let data = StructSignature::of(f.db, s);
                     write!(f, "&{}", data.name.display(f.db, f.edition()))?;
@@ -940,17 +957,15 @@ fn render_const_scalar_inner<'db>(
                 _ => f.write_str("<unsized-enum-or-union>"),
             },
             _ => {
-                let addr = usize::from_le_bytes(match b.try_into() {
-                    Ok(b) => b,
-                    Err(_) => {
-                        never!(
-                            "tried rendering ty {:?} in const ref with incorrect byte count {}",
-                            t,
-                            b.len()
-                        );
-                        return f.write_str("<layout-error>");
-                    }
-                });
+                if b.len() != ptr_size {
+                    never!(
+                        "tried rendering ty {:?} in const ref with incorrect byte count {}",
+                        t,
+                        b.len()
+                    );
+                    return f.write_str("<layout-error>");
+                }
+                let addr = u128::from_le_bytes(pad16(b, IsSigned::No)) as usize;
                 let Ok(layout) = f.db.layout_of_ty(t.store(), param_env.store()) else {
                     return f.write_str("<layout-error>");
                 };

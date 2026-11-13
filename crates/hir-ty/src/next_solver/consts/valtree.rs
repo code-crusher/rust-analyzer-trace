@@ -80,6 +80,7 @@ pub(super) fn allocation_to_const<'db>(
     let Ok(data_layout) = interner.db.target_data_layout(param_env.krate) else {
         return Const::error(interner);
     };
+    let ptr_size = data_layout.pointer_size().bytes_usize();
     let valtree = match ty.kind() {
         TyKind::Bool => ValTreeKind::Leaf(ScalarInt::from(memory[0] != 0)),
         TyKind::Char => {
@@ -120,8 +121,12 @@ pub(super) fn allocation_to_const<'db>(
         }
         TyKind::Ref(_, t, _) => match t.kind() {
             TyKind::Str => {
-                let addr = usize::from_le_bytes(memory[0..memory.len() / 2].try_into().unwrap());
-                let size = usize::from_le_bytes(memory[memory.len() / 2..].try_into().unwrap());
+                let Some((addr, size)) = memory.split_at_checked(ptr_size) else {
+                    never!("`str` reference with incorrect byte count {}", memory.len());
+                    return Const::error(interner);
+                };
+                let addr = u128::from_le_bytes(pad16(addr, IsSigned::No)) as usize;
+                let size = u128::from_le_bytes(pad16(size, IsSigned::No)) as usize;
                 let Some(bytes) = memory_map.get(addr, size) else {
                     return Const::error(interner);
                 };
@@ -131,8 +136,12 @@ pub(super) fn allocation_to_const<'db>(
                 ))
             }
             TyKind::Slice(ty) => {
-                let addr = usize::from_le_bytes(memory[0..memory.len() / 2].try_into().unwrap());
-                let count = usize::from_le_bytes(memory[memory.len() / 2..].try_into().unwrap());
+                let Some((addr, count)) = memory.split_at_checked(ptr_size) else {
+                    never!("slice reference with incorrect byte count {}", memory.len());
+                    return Const::error(interner);
+                };
+                let addr = u128::from_le_bytes(pad16(addr, IsSigned::No)) as usize;
+                let count = u128::from_le_bytes(pad16(count, IsSigned::No)) as usize;
                 let Ok(layout) = interner.db.layout_of_ty(ty.store(), param_env.store()) else {
                     return Const::error(interner);
                 };
@@ -156,8 +165,12 @@ pub(super) fn allocation_to_const<'db>(
                 ValTreeKind::Branch(Consts::new_from_iter(items))
             }
             TyKind::Dynamic(_, _) => {
-                let addr = usize::from_le_bytes(memory[0..memory.len() / 2].try_into().unwrap());
-                let ty_id = usize::from_le_bytes(memory[memory.len() / 2..].try_into().unwrap());
+                let Some((addr, ty_id)) = memory.split_at_checked(ptr_size) else {
+                    never!("`dyn` reference with incorrect byte count {}", memory.len());
+                    return Const::error(interner);
+                };
+                let addr = u128::from_le_bytes(pad16(addr, IsSigned::No)) as usize;
+                let ty_id = u128::from_le_bytes(pad16(ty_id, IsSigned::No)) as usize;
                 let Ok(t) = memory_map.vtable_ty(ty_id) else {
                     return Const::error(interner);
                 };
@@ -170,22 +183,20 @@ pub(super) fn allocation_to_const<'db>(
                 };
                 return allocation_to_const(interner, t, bytes, memory_map, param_env);
             }
-            TyKind::Adt(..) if memory.len() == 2 * size_of::<usize>() => {
+            TyKind::Adt(..) if memory.len() == 2 * ptr_size => {
                 // FIXME: Unsized ADT.
                 return Const::error(interner);
             }
             _ => {
-                let addr = usize::from_le_bytes(match memory.try_into() {
-                    Ok(b) => b,
-                    Err(_) => {
-                        never!(
-                            "tried rendering ty {:?} in const ref with incorrect byte count {}",
-                            t,
-                            memory.len()
-                        );
-                        return Const::error(interner);
-                    }
-                });
+                if memory.len() != ptr_size {
+                    never!(
+                        "tried rendering ty {:?} in const ref with incorrect byte count {}",
+                        t,
+                        memory.len()
+                    );
+                    return Const::error(interner);
+                }
+                let addr = u128::from_le_bytes(pad16(memory, IsSigned::No)) as usize;
                 let Ok(layout) = interner.db.layout_of_ty(t.store(), param_env.store()) else {
                     return Const::error(interner);
                 };

@@ -6483,6 +6483,49 @@ const FOO$0: (&str, &str) = {
     );
 }
 
+#[test]
+fn hover_const_eval_non_host_pointer_size() {
+    // Const evaluation used to bail out for targets whose pointer size differs from the host's,
+    // showing the unevaluated expression instead. Regression test for #23480.
+    check(
+        r#"
+//- target_data_layout: e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64
+//- target_arch: other
+const FOO$0: usize = 1 + 1;
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            ra_test_fixture
+            ```
+
+            ```rust
+            const FOO: usize = 2
+            ```
+        "#]],
+    );
+    check(
+        r#"
+//- target_data_layout: e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64
+//- target_arch: other
+//- minicore: slice, index, coerce_unsized
+const FOO$0: &[i32] = &[1, 2, 3 + 4];
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            ra_test_fixture
+            ```
+
+            ```rust
+            const FOO: &[i32] = &[1, 2, 7]
+            ```
+        "#]],
+    );
+}
+
 // FIXME(next-solver): this fails to normalize the const, probably due to the solver
 // refusing to give the impl because of the error type.
 #[test]

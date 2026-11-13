@@ -14,6 +14,7 @@ use crate::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, from_bytes, not_supported, pad16,
+        usize_from_bytes,
     },
     next_solver::Region,
 };
@@ -207,7 +208,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 ),
             };
             let offset = layout.fields.offset(i).bytes_usize();
-            self.write_memory(tmp, &addr.offset(offset).to_bytes())?;
+            self.write_memory(tmp, &addr.offset(offset).to_bytes(self.ptr_size()))?;
             self.exec_clone(
                 def,
                 &[arg],
@@ -235,10 +236,10 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, size.get(self)?);
-                let align = from_bytes!(usize, align.get(self)?);
+                let size = usize_from_bytes(size.get(self)?);
+                let align = usize_from_bytes(align.get(self)?);
                 let result = self.heap_allocate(size, align)?;
-                destination.write_from_bytes(self, &result.to_bytes())?;
+                destination.write_from_bytes(self, &result.to_bytes(self.ptr_size()))?;
             }
             _ if alloc_fn.contains(AttrFlags::RUSTC_DEALLOCATOR) => { /* no-op for now */ }
             _ if alloc_fn.contains(AttrFlags::RUSTC_REALLOCATOR) => {
@@ -247,17 +248,17 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let old_size = from_bytes!(usize, old_size.get(self)?);
-                let new_size = from_bytes!(usize, new_size.get(self)?);
+                let old_size = usize_from_bytes(old_size.get(self)?);
+                let new_size = usize_from_bytes(new_size.get(self)?);
                 if old_size >= new_size {
                     destination.write_from_interval(self, ptr.interval)?;
                 } else {
                     let ptr = Address::from_bytes(ptr.get(self)?)?;
-                    let align = from_bytes!(usize, align.get(self)?);
+                    let align = usize_from_bytes(align.get(self)?);
                     let result = self.heap_allocate(new_size, align)?;
                     Interval { addr: result, size: old_size }
                         .write_from_interval(self, Interval { addr: ptr, size: old_size })?;
-                    destination.write_from_bytes(self, &result.to_bytes())?;
+                    destination.write_from_bytes(self, &result.to_bytes(self.ptr_size()))?;
                 }
             }
             _ => not_supported!("unknown alloc function"),
@@ -312,7 +313,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 while let TyKind::Ref(_, ty, _) = arg.ty.kind() {
                     if ty.is_str() {
                         let (pointee, metadata) = arg.interval.get(self)?.split_at(self.ptr_size());
-                        let len = from_bytes!(usize, metadata);
+                        let len = usize_from_bytes(metadata);
 
                         return {
                             Err(MirEvalError::Panic(
@@ -380,7 +381,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 let addr = Address::from_bytes(buf.get(self)?)?;
-                let size = from_bytes!(usize, len.get(self)?);
+                let size = usize_from_bytes(len.get(self)?);
                 for i in 0..size {
                     let rand_byte = self.random_state.rand_u64() as u8;
                     self.write_memory(addr.offset(i), &[rand_byte])?;
@@ -409,7 +410,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 };
                 let addr1 = Address::from_bytes(ptr1.get(self)?)?;
                 let addr2 = Address::from_bytes(ptr2.get(self)?)?;
-                let size = from_bytes!(usize, size.get(self)?);
+                let size = usize_from_bytes(size.get(self)?);
                 let slice1 = self.read_memory(addr1, size)?;
                 let slice2 = self.read_memory(addr2, size)?;
                 let r: i128 = match slice1.cmp(slice2) {
@@ -428,7 +429,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let fd = u128::from_le_bytes(pad16(fd.get(self)?, IsSigned::No));
                 let interval = Interval {
                     addr: Address::from_bytes(ptr.get(self)?)?,
-                    size: from_bytes!(usize, len.get(self)?),
+                    size: usize_from_bytes(len.get(self)?),
                 };
                 match fd {
                     1 => {
@@ -472,7 +473,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "pthread_getspecific arg0 is not provided".into(),
                     ));
                 };
-                let key = from_bytes!(usize, &pad16(arg0.get(self)?, IsSigned::No)[0..8]);
+                let key = usize_from_bytes(&pad16(arg0.get(self)?, IsSigned::No)[0..8]);
                 let value = self.thread_local_storage.get_key(key)?;
                 destination.write_from_bytes(self, &value.to_le_bytes()[0..destination.size])?;
                 Ok(())
@@ -483,7 +484,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "pthread_setspecific arg0 is not provided".into(),
                     ));
                 };
-                let key = from_bytes!(usize, &pad16(arg0.get(self)?, IsSigned::No)[0..8]);
+                let key = usize_from_bytes(&pad16(arg0.get(self)?, IsSigned::No)[0..8]);
                 let Some(arg1) = args.get(1) else {
                     return Err(MirEvalError::InternalError(
                         "pthread_setspecific arg1 is not provided".into(),
@@ -548,7 +549,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         value.push('\0');
                         let addr = self.heap_allocate(value.len(), 1)?;
                         self.write_memory(addr, value.as_bytes())?;
-                        self.write_memory(destination.addr, &addr.to_bytes())?;
+                        self.write_memory(destination.addr, &addr.to_bytes(self.ptr_size()))?;
                     }
                 }
                 Ok(())
@@ -753,11 +754,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 if let Some((size, _)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &size.to_le_bytes())
+                    destination.write_from_bytes(self, &size.to_le_bytes()[..destination.size])
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (size, _) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &size.to_le_bytes())
+                    destination.write_from_bytes(self, &size.to_le_bytes()[..destination.size])
                 }
             }
             "align_of_val" => {
@@ -772,11 +773,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 if let Some((_, align)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &align.to_le_bytes())
+                    destination.write_from_bytes(self, &align.to_le_bytes()[..destination.size])
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (_, align) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &align.to_le_bytes())
+                    destination.write_from_bytes(self, &align.to_le_bytes()[..destination.size])
                 }
             }
             "type_name" => {
@@ -789,10 +790,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let len = ty_name.len();
                 let addr = self.heap_allocate(len, 1)?;
                 self.write_memory(addr, ty_name.as_bytes())?;
-                destination.slice(0..self.ptr_size()).write_from_bytes(self, &addr.to_bytes())?;
+                destination
+                    .slice(0..self.ptr_size())
+                    .write_from_bytes(self, &addr.to_bytes(self.ptr_size()))?;
                 destination
                     .slice(self.ptr_size()..2 * self.ptr_size())
-                    .write_from_bytes(self, &len.to_le_bytes())
+                    .write_from_bytes(self, &len.to_le_bytes()[..self.ptr_size()])
             }
             "needs_drop" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -992,7 +995,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 };
                 let src = Address::from_bytes(src.get(self)?)?;
                 let dst = Address::from_bytes(dst.get(self)?)?;
-                let offset = from_bytes!(usize, offset.get(self)?);
+                let offset = usize_from_bytes(offset.get(self)?);
                 let size = self.size_of_sized(ty, locals, "copy_nonoverlapping ptr type")?;
                 let size = offset * size;
                 let src = Interval { addr: src, size };
@@ -1023,8 +1026,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ));
                 };
                 let slice_ptr = Address::from_bytes(data)?;
-                let len = from_bytes!(usize, len);
-                let index = from_bytes!(usize, index.get(self)?);
+                let len = usize_from_bytes(len);
+                let index = usize_from_bytes(index.get(self)?);
                 if index >= len {
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "slice_get_unchecked index {index} is out of bounds for slice of length {len}"
@@ -1034,7 +1037,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let offset = index* size;
                 let addr = slice_ptr.to_usize() + offset;
                 let addr = Address::from_usize(addr);
-                destination.write_from_bytes(self, &addr.to_bytes()[..destination.size])
+                destination.write_from_bytes(self, &addr.to_bytes(self.ptr_size()))
             }
             "offset" | "arith_offset" => {
                 let [ptr, offset] = args else {
@@ -1274,7 +1277,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "write_bytes args are not provided".into(),
                     ));
                 };
-                let count = from_bytes!(usize, count.get(self)?);
+                let count = usize_from_bytes(count.get(self)?);
                 let val = from_bytes!(u8, val.get(self)?);
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
@@ -1380,10 +1383,10 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         "const_allocate args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, size.get(self)?);
-                let align = from_bytes!(usize, align.get(self)?);
+                let size = usize_from_bytes(size.get(self)?);
+                let align = usize_from_bytes(align.get(self)?);
                 let result = self.heap_allocate(size, align)?;
-                destination.write_from_bytes(self, &result.to_bytes())
+                destination.write_from_bytes(self, &result.to_bytes(self.ptr_size()))
             }
             "const_deallocate" => Ok(()),
             "caller_location" => {
@@ -1415,7 +1418,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                 self.size_of_sized(field_ty, locals, "caller_location field")?;
                             if size == ptr_size * 2 {
                                 // The string slice pointing at the file name: (data pointer, length).
-                                let mut bytes = file_addr.to_bytes()[..ptr_size].to_vec();
+                                let mut bytes = file_addr.to_bytes(ptr_size);
                                 bytes.extend_from_slice(&file_len.to_le_bytes()[..ptr_size]);
                                 bytes
                             } else {
@@ -1433,7 +1436,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let location_addr =
                     self.heap_allocate(layout.size.bytes_usize(), layout.align.bytes() as usize)?;
                 self.write_memory(location_addr, &location)?;
-                destination.write_from_bytes(self, &location_addr.to_bytes()[..ptr_size])
+                destination.write_from_bytes(self, &location_addr.to_bytes(ptr_size))
             }
             "box_new" => {
                 let ty = generic_args.type_at(0);
@@ -1442,7 +1445,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 };
                 let addr = self.heap_allocate(size, align)?;
                 self.copy_from_interval(addr, args[0].interval)?;
-                destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
+                destination.write_from_bytes(self, &addr.to_bytes(self.ptr_size()))
             }
             _ if needs_override => not_supported!("intrinsic {name} is not implemented"),
             _ => return Ok(false),
@@ -1457,9 +1460,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         locals: &Locals<'a, 'db>,
     ) -> Result<'db, (usize, usize)> {
         Ok(match ty.kind() {
-            TyKind::Str => (from_bytes!(usize, metadata.get(self)?), 1),
+            TyKind::Str => (usize_from_bytes(metadata.get(self)?), 1),
             TyKind::Slice(inner) => {
-                let len = from_bytes!(usize, metadata.get(self)?);
+                let len = usize_from_bytes(metadata.get(self)?);
                 let (size, align) = self.size_align_of_sized(inner, locals, "slice inner type")?;
                 (size * len, align)
             }

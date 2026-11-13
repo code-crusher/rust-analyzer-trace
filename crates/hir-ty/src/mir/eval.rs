@@ -109,7 +109,7 @@ impl<'db> VTableMap<'db> {
     }
 
     fn ty_of_bytes(&self, bytes: &[u8]) -> Result<'db, Ty<'db>> {
-        let id = from_bytes!(usize, bytes);
+        let id = usize_from_bytes(bytes);
         self.ty(id)
     }
 
@@ -292,33 +292,35 @@ impl IntervalOrOwned {
     }
 }
 
-#[cfg(target_pointer_width = "64")]
-const STACK_OFFSET: usize = 1 << 60;
-#[cfg(target_pointer_width = "64")]
-const HEAP_OFFSET: usize = 1 << 59;
+// Fake addresses are stored in the simulated memory as target pointer sized integers, so they have
+// to fit into the target's pointer size, which can be smaller than the host's.
+const STACK_OFFSET: usize = 1 << 31;
+const HEAP_OFFSET: usize = 1 << 30;
 
-#[cfg(target_pointer_width = "32")]
-const STACK_OFFSET: usize = 1 << 30;
-#[cfg(target_pointer_width = "32")]
-const HEAP_OFFSET: usize = 1 << 29;
+/// Reads an integer of the given byte length as a `usize`, truncating to the host pointer size.
+pub(super) fn usize_from_bytes(it: &[u8]) -> usize {
+    u128::from_le_bytes(pad16(it, IsSigned::No)) as usize
+}
 
 impl Address {
     fn from_bytes<'db>(it: &[u8]) -> Result<'db, Self> {
-        Ok(Address::from_usize(from_bytes!(usize, it)))
+        Ok(Address::from_usize(usize_from_bytes(it)))
     }
 
     fn from_usize(it: usize) -> Self {
-        if it > STACK_OFFSET {
+        if it >= STACK_OFFSET {
             Stack(it - STACK_OFFSET)
-        } else if it > HEAP_OFFSET {
+        } else if it >= HEAP_OFFSET {
             Heap(it - HEAP_OFFSET)
         } else {
             Invalid(it)
         }
     }
 
-    fn to_bytes(&self) -> [u8; size_of::<usize>()] {
-        usize::to_le_bytes(self.to_usize())
+    fn to_bytes(&self, ptr_size: usize) -> Vec<u8> {
+        // `pad16` covers every pointer size we can encounter: targets with a pointer wider than
+        // the host's are rejected before evaluation starts.
+        pad16(&self.to_usize().to_le_bytes(), IsSigned::No)[..ptr_size].to_vec()
     }
 
     fn to_usize(&self) -> usize {
@@ -475,8 +477,9 @@ pub fn interpret_mir<'db>(
     let ty = body.locals[return_slot()].ty.as_ref();
     let mut evaluator = Evaluator::new(db, body.owner, assert_placeholder_ty_is_unused, trait_env)?;
     let it: Result<'db, Allocation<'db>> = (|| {
-        if evaluator.ptr_size() != size_of::<usize>() {
-            not_supported!("targets with different pointer size from host");
+        if evaluator.ptr_size() > size_of::<usize>() {
+            // Our fake addresses don't fit into a target pointer that is wider than the host's.
+            not_supported!("targets with a pointer size larger than the host's");
         }
         let interval = evaluator.interpret_mir(body, None.into_iter())?;
         let bytes = interval.get(&evaluator)?;
@@ -656,13 +659,12 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     } else {
                         None
                     };
-                    let it = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
+                    let it = usize_from_bytes(self.read_memory(addr, self.ptr_size())?);
                     addr = Address::from_usize(it);
                 }
                 ProjectionElem::Index(op) => {
-                    let offset = from_bytes!(
-                        usize,
-                        self.read_memory(locals.ptr[*op].addr, self.ptr_size())?
+                    let offset = usize_from_bytes(
+                        self.read_memory(locals.ptr[*op].addr, self.ptr_size())?,
                     );
                     metadata = None; // Result of index is always sized
                     let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
@@ -678,7 +680,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                 }
                             },
                             TyKind::Slice(_) => match metadata {
-                                Some(it) => from_bytes!(u64, it.get(self)?),
+                                Some(it) => usize_from_bytes(it.get(self)?) as u64,
                                 None => not_supported!("slice place without metadata"),
                             },
                             _ => not_supported!("bad type for const index"),
@@ -698,10 +700,10 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     };
                     metadata = match metadata {
                         Some(it) => {
-                            let prev_len = from_bytes!(u64, it.get(self)?);
-                            Some(IntervalOrOwned::Owned(
-                                (prev_len - from - to).to_le_bytes().to_vec(),
-                            ))
+                            let prev_len = usize_from_bytes(it.get(self)?) as u64;
+                            let mut bytes = (prev_len - from - to).to_le_bytes().to_vec();
+                            bytes.truncate(self.ptr_size());
+                            Some(IntervalOrOwned::Owned(bytes))
                         }
                         None => None,
                     };
@@ -1036,7 +1038,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             Rvalue::Use(it) => Borrowed(self.eval_operand(it, locals)?),
             Rvalue::Ref(_, p) => {
                 let (addr, _, metadata) = self.place_addr_and_ty_and_metadata(p, locals)?;
-                let mut r = addr.to_bytes().to_vec();
+                let mut r = addr.to_bytes(self.ptr_size());
                 if let Some(metadata) = metadata {
                     r.extend(metadata.get(self)?);
                 }
@@ -1116,8 +1118,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                                 "Only eq is builtin for `str`".to_owned(),
                             ));
                         }
-                        let ls = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);
-                        let rs = from_bytes!(usize, &rc[self.ptr_size()..self.ptr_size() * 2]);
+                        let ls = usize_from_bytes(&lc[self.ptr_size()..self.ptr_size() * 2]);
+                        let rs = usize_from_bytes(&rc[self.ptr_size()..self.ptr_size() * 2]);
                         if ls != rs {
                             break 'binary_op Owned(vec![0]);
                         }
@@ -1632,10 +1634,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                         Some(it) => it as usize,
                     };
-                    let mut r = Vec::with_capacity(16);
-                    let addr = addr.get(self)?;
-                    r.extend(addr.iter().copied());
-                    r.extend(len.to_le_bytes());
+                    let mut r = addr.get(self)?.to_vec();
+                    r.extend(&len.to_le_bytes()[..self.ptr_size()]);
                     Owned(r)
                 }
                 t => {
@@ -1644,10 +1644,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             },
             TyKind::Dynamic(..) => {
                 let vtable = self.vtable_map.id(current_ty);
-                let mut r = Vec::with_capacity(16);
-                let addr = addr.get(self)?;
-                r.extend(addr.iter().copied());
-                r.extend(vtable.to_le_bytes());
+                let mut r = addr.get(self)?.to_vec();
+                r.extend(&vtable.to_le_bytes()[..self.ptr_size()]);
                 Owned(r)
             }
             TyKind::Adt(adt_def, target_subst) => match &current_ty.kind() {
@@ -1878,9 +1876,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     let bytes_addr = self.heap_allocate(bytes.len(), 1)?;
                     self.write_memory(bytes_addr, &bytes)?;
                     let ref_addr = self.heap_allocate(self.ptr_size() * 2, self.ptr_size())?;
-                    self.write_memory(ref_addr, &bytes_addr.to_bytes())?;
-                    let mut len = [0; 16];
-                    len[..size_of::<usize>()].copy_from_slice(&bytes.len().to_le_bytes());
+                    self.write_memory(ref_addr, &bytes_addr.to_bytes(self.ptr_size()))?;
+                    let len = bytes.len().to_le_bytes();
                     self.write_memory(ref_addr.offset(self.ptr_size()), &len[..self.ptr_size()])?;
                     Ok(Interval::new(ref_addr, self.ptr_size() * 2))
                 }
@@ -1906,9 +1903,8 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         self.copy_from_interval(items_addr.offset(i * item_size), *item)?;
                     }
                     let ref_addr = self.heap_allocate(self.ptr_size() * 2, self.ptr_size())?;
-                    self.write_memory(ref_addr, &items_addr.to_bytes())?;
-                    let mut len = [0; 16];
-                    len[..size_of::<usize>()].copy_from_slice(&items.len().to_le_bytes());
+                    self.write_memory(ref_addr, &items_addr.to_bytes(self.ptr_size()))?;
+                    let len = items.len().to_le_bytes();
                     self.write_memory(ref_addr.offset(self.ptr_size()), &len[..self.ptr_size()])?;
                     Ok(Interval::new(ref_addr, self.ptr_size() * 2))
                 }
@@ -1916,7 +1912,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 _ => {
                     let inner_addr = self.allocate_valtree_in_heap(inner_ty, valtree)?;
                     let ref_addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
-                    self.write_memory(ref_addr, &inner_addr.addr.to_bytes())?;
+                    self.write_memory(ref_addr, &inner_addr.addr.to_bytes(self.ptr_size()))?;
                     Ok(Interval::new(ref_addr, self.ptr_size()))
                 }
             },
@@ -2019,7 +2015,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             &patch_map,
             |bytes| match memory_map {
                 MemoryMap::Empty | MemoryMap::Simple(_) => {
-                    Err(MirEvalError::InvalidVTableId(from_bytes!(usize, bytes)))
+                    Err(MirEvalError::InvalidVTableId(usize_from_bytes(bytes)))
                 }
                 MemoryMap::Complex(cm) => cm.vtable.ty_of_bytes(bytes),
             },
@@ -2236,7 +2232,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     let size = this.size_align_of(t, locals)?;
                     match size {
                         Some((size, _)) => {
-                            let addr_usize = from_bytes!(usize, bytes);
+                            let addr_usize = usize_from_bytes(bytes);
                             let bytes =
                                 this.read_memory(Address::from_usize(addr_usize), size)?.to_vec();
                             mm.insert(addr_usize, bytes.clone().into());
@@ -2244,7 +2240,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                         None => {
                             let mut check_inner = None;
-                            let (addr, meta) = bytes.split_at(bytes.len() / 2);
+                            let (addr, meta) = bytes.split_at(this.ptr_size());
                             let element_size = match t.kind() {
                                 TyKind::Str => 1,
                                 TyKind::Slice(t) => {
@@ -2260,7 +2256,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                             };
                             let count = match t.kind() {
                                 TyKind::Dynamic(..) => 1,
-                                _ => from_bytes!(usize, meta),
+                                _ => usize_from_bytes(meta),
                             };
                             let size = element_size * count;
                             let addr = Address::from_bytes(addr)?;
@@ -2409,10 +2405,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 let size = self.size_align_of(t, locals)?;
                 match size {
                     Some(_) => {
-                        let current = from_bytes!(usize, self.read_memory(addr, my_size)?);
+                        let current = usize_from_bytes(self.read_memory(addr, my_size)?);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &it.to_le_bytes())?;
+                                self.write_memory(
+                                    addr,
+                                    &it.to_le_bytes()[..self.ptr_size()],
+                                )?;
                                 *it
                             }
                             None => current,
@@ -2427,19 +2426,22 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     }
                     None => {
                         let bytes = self.read_memory(addr, my_size)?;
-                        let (current, metadata) = bytes.split_at(my_size / 2);
+                        let (current, metadata) = bytes.split_at(self.ptr_size());
                         let metadata = metadata.to_vec();
-                        let current = from_bytes!(usize, current);
+                        let current = usize_from_bytes(current);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &it.to_le_bytes())?;
+                                self.write_memory(
+                                    addr,
+                                    &it.to_le_bytes()[..self.ptr_size()],
+                                )?;
                                 *it
                             }
                             None => current,
                         };
                         let patched = Address::from_usize(patched);
                         if let TyKind::Slice(inner) = t.kind() {
-                            let len = from_bytes!(usize, metadata);
+                            let len = usize_from_bytes(&metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;
                             for i in 0..len {
                                 self.patch_addresses(
@@ -2457,7 +2459,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             TyKind::FnPtr(_, _) => {
                 let ty = ty_of_bytes(self.read_memory(addr, my_size)?)?;
                 let new_id = self.vtable_map.id(ty);
-                self.write_memory(addr, &new_id.to_le_bytes())?;
+                self.write_memory(addr, &new_id.to_le_bytes()[..self.ptr_size()])?;
             }
             TyKind::Adt(id, args) => match id.def_id() {
                 AdtId::StructId(s) => {
@@ -2555,7 +2557,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         target_bb: Option<BasicBlockId>,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'a, 'db>>> {
-        let id = from_bytes!(usize, bytes.get(self)?);
+        let id = usize_from_bytes(bytes.get(self)?);
         let next_ty = self.vtable_map.ty(id)?;
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
@@ -2595,7 +2597,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
         let closure_data =
             if mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some() {
-                closure_data.addr.to_bytes().to_vec()
+                closure_data.addr.to_bytes(self.ptr_size())
             } else {
                 closure_data.get(self)?.to_owned()
             };
@@ -2830,7 +2832,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             func_ty = z;
             if matches!(func_ty.kind(), TyKind::Dynamic(..)) {
                 let id =
-                    from_bytes!(usize, &func_data.get(self)?[self.ptr_size()..self.ptr_size() * 2]);
+                    usize_from_bytes(&func_data.get(self)?[self.ptr_size()..self.ptr_size() * 2]);
                 func_data = func_data.slice(0..self.ptr_size());
                 func_ty = self.vtable_map.ty(id)?;
             }
@@ -2905,7 +2907,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             Interval::new(addr, size)
         };
         let addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
-        self.write_memory(addr, &result.addr.to_bytes())?;
+        self.write_memory(addr, &result.addr.to_bytes(self.ptr_size()))?;
         self.static_locations.insert(st, addr);
         Ok(addr)
     }
@@ -2981,7 +2983,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 body,
                 locals,
                 drop_impl,
-                iter::once(IntervalOrOwned::Owned(addr.to_bytes().to_vec())),
+                iter::once(IntervalOrOwned::Owned(addr.to_bytes(self.ptr_size()))),
                 span,
                 Interval { addr: Address::Invalid(0), size: 0 },
                 None,
@@ -3097,13 +3099,16 @@ pub fn render_const_using_debug_impl<'db>(
     // i.e. two words: a pointer to the value, and the type-erased `<T as Debug>::fmt` function.
     // A non-null `value` is what distinguishes the `Placeholder` variant from `Count`.
     let argument = evaluator.heap_allocate(ptr_size * 2, ptr_size)?;
-    evaluator.write_memory(argument, &data.addr.to_bytes())?;
+    evaluator.write_memory(argument, &data.addr.to_bytes(ptr_size))?;
     let debug_fmt_fn_ptr = evaluator.vtable_map.id(Ty::new_fn_def(
         evaluator.interner(),
         CallableDefId::FunctionId(debug_fmt_fn).into(),
         GenericArgs::new_from_slice(&[ty.into()]),
     ));
-    evaluator.write_memory(argument.offset(ptr_size), &debug_fmt_fn_ptr.to_le_bytes())?;
+    evaluator.write_memory(
+        argument.offset(ptr_size),
+        &debug_fmt_fn_ptr.to_le_bytes()[..ptr_size],
+    )?;
     // Since Rust 1.93 `core::fmt::Arguments` is two words wide:
     //   struct Arguments<'a> { template: NonNull<u8>, args: NonNull<Argument<'a>> }
     // `template` points at a byte-encoded format string; `format_args!("{:?}", x)` encodes to a
@@ -3114,8 +3119,8 @@ pub fn render_const_using_debug_impl<'db>(
     let template = evaluator.heap_allocate(2, 1)?;
     evaluator.write_memory(template, &[0xC0, 0x00])?;
     let arguments = evaluator.heap_allocate(ptr_size * 2, ptr_size)?;
-    evaluator.write_memory(arguments, &template.to_bytes())?;
-    evaluator.write_memory(arguments.offset(ptr_size), &argument.to_bytes())?;
+    evaluator.write_memory(arguments, &template.to_bytes(ptr_size))?;
+    evaluator.write_memory(arguments.offset(ptr_size), &argument.to_bytes(ptr_size))?;
     let Some(ValueNs::FunctionId(format_fn)) = resolver.resolve_path_in_value_ns_fully(
         db,
         &hir_def::expr_store::path::Path::from_known_path_with_no_generic(path![std::fmt::format]),
@@ -3129,9 +3134,9 @@ pub fn render_const_using_debug_impl<'db>(
     )?;
     let message_string = interval.get(&evaluator)?;
     let words = [
-        from_bytes!(usize, message_string[0..ptr_size]),
-        from_bytes!(usize, message_string[ptr_size..2 * ptr_size]),
-        from_bytes!(usize, message_string[2 * ptr_size..3 * ptr_size]),
+        usize_from_bytes(&message_string[0..ptr_size]),
+        usize_from_bytes(&message_string[ptr_size..2 * ptr_size]),
+        usize_from_bytes(&message_string[2 * ptr_size..3 * ptr_size]),
     ];
     let Some(addr) = words.into_iter().map(Address::from_usize).find(|it| matches!(it, Heap(_)))
     else {
