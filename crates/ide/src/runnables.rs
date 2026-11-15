@@ -159,17 +159,20 @@ pub(crate) fn runnables(db: &RootDatabase, file_id: FileId) -> Vec<Runnable> {
             _ => None,
         };
         add_opt(runnable.or_else(|| module_def_doctest(&sema, def)), Some(def));
-        if let Definition::SelfType(impl_) = def {
-            impl_.items(db).into_iter().for_each(|assoc| {
-                let runnable = match assoc {
-                    hir::AssocItem::Function(it) => {
-                        runnable_fn(&sema, it).or_else(|| module_def_doctest(&sema, it.into()))
-                    }
-                    hir::AssocItem::Const(it) => module_def_doctest(&sema, it.into()),
-                    hir::AssocItem::TypeAlias(it) => module_def_doctest(&sema, it.into()),
-                };
-                add_opt(runnable, Some(assoc.into()))
-            });
+        let items = match def {
+            Definition::SelfType(impl_) => impl_.items(db),
+            Definition::Trait(trait_) => trait_.items(db),
+            _ => Vec::new(),
+        };
+        for assoc in items {
+            let runnable = match assoc {
+                hir::AssocItem::Function(it) => {
+                    runnable_fn(&sema, it).or_else(|| module_def_doctest(&sema, it.into()))
+                }
+                hir::AssocItem::Const(it) => module_def_doctest(&sema, it.into()),
+                hir::AssocItem::TypeAlias(it) => module_def_doctest(&sema, it.into()),
+            };
+            add_opt(runnable, Some(assoc.into()))
         }
     });
 
@@ -517,19 +520,23 @@ fn module_def_doctest(sema: &Semantics<'_, RootDatabase>, def: Definition<'_>) -
             .flat_map(|it| it.name(db))
             .for_each(|name| format_to!(path, "{}::", name.display(db, edition)));
         // This probably belongs to canonical_path?
-        if let Some(assoc_item) = def.as_assoc_item(db)
-            && let Some(ty) = assoc_item.implementing_ty(db)
-            && let Some(adt) = ty.as_adt()
-        {
-            let name = adt.name(db);
-            let mut ty_args = ty.generic_parameters(db, display_target).peekable();
-            format_to!(path, "{}", name.display(db, edition));
-            if ty_args.peek().is_some() {
-                format_to!(path, "<{}>", ty_args.format_with(",", |ty, cb| cb(&ty)));
+        if let Some(assoc_item) = def.as_assoc_item(db) {
+            if let Some(ty) = assoc_item.implementing_ty(db)
+                && let Some(adt) = ty.as_adt()
+            {
+                let name = adt.name(db);
+                let mut ty_args = ty.generic_parameters(db, display_target).peekable();
+                format_to!(path, "{}", name.display(db, edition));
+                if ty_args.peek().is_some() {
+                    format_to!(path, "<{}>", ty_args.format_with(",", |ty, cb| cb(&ty)));
+                }
+                format_to!(path, "::{}", def_name.display(db, edition));
+                path.retain(|c| c != ' ');
+                return Some(path);
             }
-            format_to!(path, "::{}", def_name.display(db, edition));
-            path.retain(|c| c != ' ');
-            return Some(path);
+            if let Some(trait_) = assoc_item.container_or_implemented_trait(db) {
+                format_to!(path, "{}::", trait_.name(db).display(db, edition));
+            }
         }
         format_to!(path, "{}", def_name.display(db, edition));
         Some(path)
@@ -947,6 +954,30 @@ impl Data {
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
                     "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 44..98, name: \"foo\" })",
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_runnables_doc_test_in_trait() {
+        check(
+            r#"
+//- /lib.rs
+$0
+fn main() {}
+
+trait Trait {
+    /// ```
+    /// let x = 5;
+    /// ```
+    fn method(&self);
+}
+"#,
+            expect![[r#"
+                [
+                    "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 33..93, name: \"method\", container_name: \"Trait\" })",
                 ]
             "#]],
         );
