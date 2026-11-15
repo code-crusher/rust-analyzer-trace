@@ -1,7 +1,9 @@
 //! Tests that don't fit into a specific category.
 
+use base_db::{FileSet, SourceRoot, VfsPath};
 use expect_test::{Expect, expect};
-use ide_db::SymbolKind;
+use hir::db::HirDatabase;
+use ide_db::{FilePosition, RootDatabase, SymbolKind, base_db, span::TextSize};
 
 use crate::{
     CompletionItemKind,
@@ -1779,4 +1781,38 @@ fn foo<const N: $0>() {}
             kw self::
         "#]],
     );
+}
+
+/// Regression test for issue #23342.
+///
+/// A crate graph can be empty during startup, e.g. when a discover command doesn't support the
+/// current directory. Completing `1.` asks for the crate of `i32` (via `BuiltinType::ty`), which
+/// used to index into the empty crate list and panic.
+#[test]
+fn no_panic_on_empty_crate_graph() {
+    let mut db = RootDatabase::default();
+
+    // Note that we deliberately do not set a crate graph, unlike `ChangeFixture`, which always
+    // creates at least one crate.
+    let mut change = hir::ChangeWithProcMacros::default();
+    let file_id = base_db::FileId::from_raw(0);
+    let path = VfsPath::new_virtual_path("/main.rs".to_owned());
+    let mut file_set = FileSet::default();
+    file_set.insert(file_id, path);
+    change.set_roots(vec![SourceRoot::new_local(file_set)]);
+    change.change_file(file_id, Some("fn main() { 1. }".to_owned()));
+    db.apply_change(change);
+
+    assert!(base_db::all_crates(&db).is_empty(), "test needs an empty crate graph");
+
+    // This used to panic with `index out of bounds: the len is 0 but the index is 0`.
+    let i32_ty = hir::BuiltinType::i32().ty(&db);
+    assert!(i32_ty.krate(&db).is_none());
+
+    // And the same through the completion interface, which is how the issue was reported.
+    let position = FilePosition { file_id, offset: TextSize::from(14) };
+    let _ = hir::attach_db(&db, || {
+        HirDatabase::zalsa_register_downcaster(&db);
+        crate::completions(&db, &TEST_CONFIG, position, None)
+    });
 }

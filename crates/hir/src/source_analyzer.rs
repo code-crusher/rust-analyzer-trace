@@ -280,7 +280,7 @@ impl<'db> SourceAnalyzer<'db> {
             type_owner: resolver
                 .generic_def()
                 .map(Into::into)
-                .unwrap_or_else(|| TypeOwnerId::NoParams(resolver.krate())),
+                .unwrap_or_else(|| TypeOwnerId::NoParams(Some(resolver.krate()))),
             resolver,
             body_or_sig: None,
             file_id: node.file_id,

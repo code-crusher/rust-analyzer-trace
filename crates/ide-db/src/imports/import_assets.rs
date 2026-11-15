@@ -828,7 +828,9 @@ fn trait_applicable_items<'db>(
                     crates.push((adt.krate(db).into(), fingerprint));
                 }
                 // Always include environment crate
-                crates.push((ty.krate(db).into(), fingerprint));
+                if let Some(krate) = ty.krate(db) {
+                    crates.push((krate.into(), fingerprint));
+                }
                 Some(crates)
             })
             .flatten()

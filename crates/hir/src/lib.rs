@@ -533,7 +533,17 @@ impl HasCrate for ModuleDef {
     fn krate(&self, db: &dyn HirDatabase) -> Crate {
         match self.module(db) {
             Some(module) => module.krate(db),
-            None => Crate::core(db).unwrap_or_else(|| all_crates(db)[0].into()),
+            None => Crate::core(db)
+                .or_else(|| all_crates(db).first().copied().map(Into::into))
+                .unwrap_or_else(|| {
+                    // We only get here for builtin types, which have no defining crate, and only
+                    // if the crate graph is empty, which can happen during startup. Return an
+                    // arbitrary crate rather than panicking; Salsa will panic if it is ever used.
+                    // SAFETY: 0 is less than `Id::MAX_U32`.
+                    let id: base_db::Crate =
+                        salsa::plumbing::FromId::from_id(unsafe { salsa::Id::from_index(0) });
+                    id.into()
+                }),
         }
     }
 }
@@ -3836,9 +3846,12 @@ impl Impl {
             Either::Left(impls) => result.extend(impls.iter().copied().map(Impl::from)),
             Either::Right(impls) => result.extend(impls.iter().copied().map(Impl::from)),
         };
+        let Some(krate) = ty.crate_id(db) else {
+            return Vec::new();
+        };
         method_resolution::with_incoherent_inherent_impls(
             db,
-            ty.krate(db),
+            krate,
             &simplified_ty,
             |impls| extend_with_impls(Either::Left(impls)),
         );
@@ -4369,7 +4382,8 @@ enum TypeOwnerId {
     GenericDefId(GenericDefId),
     BuiltinDeriveImplId(BuiltinDeriveImplId),
     // FIXME: What do when we unify two different crates? Currently we just randomly keep one.
-    NoParams(base_db::Crate),
+    // This is `None` if the crate graph is empty, which can happen during startup.
+    NoParams(Option<base_db::Crate>),
 }
 
 impl_from!(
@@ -4483,13 +4497,16 @@ impl<'db> Type<'db> {
         Self::new(owner.generic_def(db), ty)
     }
 
-    fn no_params(krate: base_db::Crate, ty: Ty<'db>) -> Self {
+    fn no_params(krate: Option<base_db::Crate>, ty: Ty<'db>) -> Self {
         Type { owner: TypeOwnerId::NoParams(krate), ty: EarlyBinder::bind(ty) }
     }
 
-    fn builtin_type_crate(db: &'db dyn HirDatabase) -> base_db::Crate {
-        // It doesn't really matter.
-        all_crates(db)[0]
+    /// The crate we associate with types that have no owner, e.g. builtin types.
+    ///
+    /// It doesn't really matter which crate we choose, so we just take the first one. This is
+    /// `None` if the crate graph is empty, which can happen during startup.
+    fn builtin_type_crate(db: &'db dyn HirDatabase) -> Option<base_db::Crate> {
+        all_crates(db).first().copied()
     }
 
     fn from_def(db: &'db dyn HirDatabase, def: impl Into<TyDefId>) -> Self {
@@ -4517,7 +4534,7 @@ impl<'db> Type<'db> {
                 GenericDefId::AdtId(AdtId::EnumId(it.lookup(db).parent))
             }
             ValueTyDefId::StaticId(it) => {
-                return Type::no_params(hir_def::HasModule::krate(&it, db), ty.skip_binder());
+                return Type::no_params(Some(hir_def::HasModule::krate(&it, db)), ty.skip_binder());
             }
         };
         Type::new(def, ty.instantiate_identity().skip_norm_wip())
@@ -4526,7 +4543,7 @@ impl<'db> Type<'db> {
     /// Replace any generic parameters with error types.
     pub fn instantiate_with_errors(&self) -> Self {
         let interner = DbInterner::conjure();
-        let krate = self.krate(interner.db());
+        let krate = self.crate_id(interner.db());
         let args = match self.owner {
             TypeOwnerId::GenericDefId(def) => GenericArgs::error_for_item(interner, def.into()),
             TypeOwnerId::BuiltinDeriveImplId(def) => {
@@ -4848,19 +4865,27 @@ impl<'db> Type<'db> {
         self.ty.skip_binder().is_ty_error()
     }
 
-    fn krate(&self, db: &'db dyn HirDatabase) -> base_db::Crate {
-        match self.owner {
+    /// Returns the crate this type is associated with.
+    ///
+    /// This is `None` for types that have no owner (e.g. builtin types) if the crate graph is
+    /// empty, which can happen during startup.
+    pub fn krate(&self, db: &'db dyn HirDatabase) -> Option<Crate> {
+        self.crate_id(db).map(Crate::from)
+    }
+
+    fn crate_id(&self, db: &'db dyn HirDatabase) -> Option<base_db::Crate> {
+        Some(match self.owner {
             TypeOwnerId::GenericDefId(def) => hir_def::HasModule::krate(&def, db),
             TypeOwnerId::BuiltinDeriveImplId(def) => {
                 hir_def::HasModule::krate(&def.loc(db).adt, db)
             }
-            TypeOwnerId::NoParams(krate) => krate,
-        }
+            TypeOwnerId::NoParams(krate) => krate?,
+        })
     }
 
-    fn param_env(&self, db: &'db dyn HirDatabase) -> ParamEnvAndCrate<'db> {
-        let krate = self.krate(db);
-        match self.owner {
+    fn param_env(&self, db: &'db dyn HirDatabase) -> Option<ParamEnvAndCrate<'db>> {
+        let krate = self.crate_id(db)?;
+        Some(match self.owner {
             TypeOwnerId::GenericDefId(def) => {
                 ParamEnvAndCrate { param_env: db.trait_environment(def), krate }
             }
@@ -4869,14 +4894,14 @@ impl<'db> Type<'db> {
                 krate,
             },
             TypeOwnerId::NoParams(_) => ParamEnvAndCrate { param_env: ParamEnv::empty(), krate },
-        }
+        })
     }
 
     /// Checks that particular type `ty` implements `std::future::IntoFuture` or
     /// `std::future::Future` and returns the `Output` associated type.
     /// This function is used in `.await` syntax completion.
     pub fn into_future_output(&self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
-        let env = self.param_env(db);
+        let env = self.param_env(db)?;
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let (trait_, output_assoc_type) = lang_items
             .IntoFuture
@@ -4897,7 +4922,7 @@ impl<'db> Type<'db> {
 
     /// This does **not** resolve `IntoFuture`, only `Future`.
     pub fn future_output(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
-        let krate = self.krate(db);
+        let krate = self.crate_id(db)?;
         let lang_items = hir_def::lang_item::lang_items(db, krate);
         let future_output = lang_items.FutureOutput?;
         self.normalize_trait_assoc_type(db, &[], future_output.into())
@@ -4905,14 +4930,16 @@ impl<'db> Type<'db> {
 
     /// This does **not** resolve `IntoIterator`, only `Iterator`.
     pub fn iterator_item(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
-        let krate = self.krate(db);
+        let krate = self.crate_id(db)?;
         let lang_items = hir_def::lang_item::lang_items(db, krate);
         let iterator_item = lang_items.IteratorItem?;
         self.normalize_trait_assoc_type(db, &[], iterator_item.into())
     }
 
     pub fn impls_iterator(self, db: &'db dyn HirDatabase) -> bool {
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let Some(iterator_trait) = lang_items.Iterator else {
             return false;
@@ -4927,7 +4954,7 @@ impl<'db> Type<'db> {
 
     /// Resolves the projection `<Self as IntoIterator>::IntoIter` and returns the resulting type
     pub fn into_iterator_iter(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
-        let env = self.param_env(db);
+        let env = self.param_env(db)?;
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let trait_ = lang_items.IntoIterator?;
 
@@ -4949,7 +4976,9 @@ impl<'db> Type<'db> {
     /// This function can be used to check if a particular type is callable, since FnOnce is a
     /// supertrait of Fn and FnMut, so all callable types implements at least FnOnce.
     pub fn impls_fnonce(&self, db: &'db dyn HirDatabase) -> bool {
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let fnonce_trait = match lang_items.FnOnce {
             Some(it) => it,
@@ -4966,7 +4995,9 @@ impl<'db> Type<'db> {
 
     // FIXME: Find better API that also handles const generics
     pub fn impls_trait(&self, db: &'db dyn HirDatabase, trait_: Trait, args: &[Type<'db>]) -> bool {
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let interner = DbInterner::new_no_crate(db);
         let (args, _owner) =
             generic_args_from_tys(interner, trait_.id.into(), iter::once(self).chain(args));
@@ -4992,7 +5023,10 @@ impl<'db> Type<'db> {
         trait_: Trait,
         args: &[Type<'db>],
     ) -> bool {
-        let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: self.krate(db) };
+        let Some(krate) = self.crate_id(db) else {
+            return false;
+        };
+        let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
         traits::implements_trait_unique_with_infcx(db, env, trait_.id, &mut |infcx| {
             let mut args = Self::instantiate_many_with_infer(iter::once(self).chain(args), infcx);
             GenericArgs::for_item(infcx.interner, trait_.id.into(), |_, param, _, _| {
@@ -5013,7 +5047,7 @@ impl<'db> Type<'db> {
         args: &[Type<'db>],
         alias: TypeAlias,
     ) -> Option<Type<'db>> {
-        let env = self.param_env(db);
+        let env = self.param_env(db)?;
         let interner = DbInterner::new_with(db, env.krate);
         let (args, owner) =
             generic_args_from_tys(interner, alias.id.into(), iter::once(self).chain(args));
@@ -5033,7 +5067,9 @@ impl<'db> Type<'db> {
     }
 
     pub fn is_copy(&self, db: &'db dyn HirDatabase) -> bool {
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let Some(copy_trait) = lang_items.Copy else {
             return false;
@@ -5051,7 +5087,7 @@ impl<'db> Type<'db> {
             // This will happen when it implements fn or fn mut, since we add an autoborrow adjustment
             TyKind::Ref(_, inner_ty, _) => return self.derived(inner_ty).as_callable(db),
             _ => {
-                let env = self.param_env(db);
+                let env = self.param_env(db)?;
                 let (fn_trait, sig) =
                     hir_ide::callable_sig_from_fn_trait(self.ty.skip_binder(), env, db)?;
                 return Some(Callable {
@@ -5205,7 +5241,10 @@ impl<'db> Type<'db> {
         let env = self.param_env(db);
         // There should be no inference vars in types passed here
         let canonical = hir_ide::replace_errors_with_variables(interner, &self.ty.skip_binder());
-        autoderef(db, env, canonical)
+        let Some(env) = env else {
+            return Either::Left(iter::once(self.ty.skip_binder()));
+        };
+        Either::Right(autoderef(db, env, canonical))
     }
 
     // This would be nicer if it just returned an iterator, but that runs into
@@ -5237,7 +5276,9 @@ impl<'db> Type<'db> {
                 }
             }
         };
-        let krate = self.krate(db);
+        let Some(krate) = self.crate_id(db) else {
+            return;
+        };
 
         let interner = DbInterner::new_no_crate(db);
         let Some(simplified_type) = fast_reject::simplify_type(
@@ -5410,11 +5451,13 @@ impl<'db> Type<'db> {
         };
         let infcx = interner.infer_ctxt().build(typing_mode);
         let features = resolver.top_level_def_map().features();
-        let environment = self.param_env(db);
+        // The type may have no crate if the crate graph is empty, in which case there are no
+        // impls to resolve anyway.
+        let param_env = self.param_env(db).map_or(ParamEnv::empty(), |it| it.param_env);
         let ctx = MethodResolutionContext {
             infcx: &infcx,
             resolver,
-            param_env: environment.param_env,
+            param_env,
             traits_in_scope,
             edition: resolver.krate().data(db).edition,
             features,
@@ -5639,11 +5682,11 @@ impl<'db> Type<'db> {
 
     pub fn env_traits(&self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Trait> {
         let _p = tracing::info_span!("env_traits").entered();
-        let env = self.param_env(db);
+        let param_env = self.param_env(db).map_or(ParamEnv::empty(), |it| it.param_env);
         self.autoderef_(db)
             .filter(|ty| matches!(ty.kind(), TyKind::Param(_)))
             .flat_map(move |ty| {
-                env.param_env
+                param_env
                     .clauses()
                     .iter()
                     .filter_map(move |pred| match pred.kind().skip_binder() {
@@ -5721,7 +5764,9 @@ impl<'db> Type<'db> {
     /// For example `Option<T>` and `Option<U>` unify although there is unresolved goal `T = U`.
     pub fn could_unify_with(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
         self.owner.must_unify(other.owner);
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let interner = DbInterner::new_no_crate(db);
         let tys = hir_ide::replace_errors_with_variables(
             interner,
@@ -5736,7 +5781,9 @@ impl<'db> Type<'db> {
     /// them. For example `Option<T>` and `Option<U>` do not unify as we cannot show that `T = U`
     pub fn could_unify_with_deeply(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
         self.owner.must_unify(other.owner);
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let interner = DbInterner::new_no_crate(db);
         let tys = hir_ide::replace_errors_with_variables(
             interner,
@@ -5747,7 +5794,9 @@ impl<'db> Type<'db> {
 
     pub fn could_coerce_to(&self, db: &'db dyn HirDatabase, to: &Type<'db>) -> bool {
         self.owner.must_unify(to.owner);
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return false;
+        };
         let interner = DbInterner::new_no_crate(db);
         let tys = hir_ide::replace_errors_with_variables(
             interner,
@@ -5772,13 +5821,17 @@ impl<'db> Type<'db> {
     }
 
     pub fn layout(&self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return Err(LayoutError::TargetLayoutNotAvailable);
+        };
         db.layout_of_ty(self.ty.skip_binder().store(), env.store())
             .map(|layout| Layout(layout, db.target_data_layout(env.krate).unwrap()))
     }
 
     pub fn drop_glue(&self, db: &'db dyn HirDatabase) -> DropGlue {
-        let env = self.param_env(db);
+        let Some(env) = self.param_env(db) else {
+            return DropGlue::None;
+        };
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         hir_ide::drop::has_drop_glue(&infcx, self.ty.skip_binder(), env.param_env)
@@ -6227,12 +6280,6 @@ impl HasCrate for Const {
 impl HasCrate for TypeAlias {
     fn krate(&self, db: &dyn HirDatabase) -> Crate {
         self.module(db).krate(db)
-    }
-}
-
-impl HasCrate for Type<'_> {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
-        self.krate(db).into()
     }
 }
 

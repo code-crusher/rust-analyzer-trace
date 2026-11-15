@@ -488,8 +488,8 @@ fn resolve_impl_trait_item<'db>(
     name: &Name,
     ns: Option<Namespace>,
 ) -> Option<DocLinkDef> {
-    let krate = ty.krate(db);
-    let param_env = ty.param_env(db);
+    let krate = ty.crate_id(db)?;
+    let param_env = ty.param_env(db)?;
     let traits_in_scope = resolver.traits_in_scope(db);
 
     // `ty.iterate_path_candidates()` require a scope, which is not available when resolving

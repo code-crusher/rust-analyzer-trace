@@ -6,9 +6,7 @@ use crate::{
     doc_links::token_as_doc_comment,
     navigation_target::{self, ToNav},
 };
-use hir::{
-    AsAssocItem, AssocItem, CallableKind, FileRange, HasCrate, InFile, ModuleDef, Semantics, sym,
-};
+use hir::{AsAssocItem, AssocItem, CallableKind, FileRange, InFile, ModuleDef, Semantics, sym};
 use ide_db::ra_fixture::{RaFixtureConfig, UpmapFromRaFixture};
 use ide_db::{
     RootDatabase, SymbolKind,
@@ -184,7 +182,7 @@ fn goto_question_mark_conversions(
     let node = ast::TryExpr::cast(node.clone())?;
     let try_expr_ty = sema.type_of_expr(&node.expr()?)?.adjusted();
 
-    let fd = FamousDefs(sema, try_expr_ty.krate(sema.db));
+    let fd = FamousDefs(sema, try_expr_ty.krate(sema.db)?);
     let result_enum = fd.core_result_Result()?.into();
 
     let (try_expr_ty_adt, try_expr_ty_args) = try_expr_ty.as_adt_with_args()?;
@@ -226,7 +224,7 @@ fn find_definition_for_known_blanket_dual_impls(
     let assoc = f.as_assoc_item(sema.db)?;
 
     let return_type = callable.return_type();
-    let fd = FamousDefs(sema, return_type.krate(sema.db));
+    let fd = FamousDefs(sema, return_type.krate(sema.db)?);
 
     let t = match assoc.container(sema.db) {
         hir::AssocItemContainer::Trait(t) => t,

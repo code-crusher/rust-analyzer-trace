@@ -6,7 +6,7 @@ mod tests;
 use std::{iter, ops::Not};
 
 use either::Either;
-use hir::{DisplayTarget, GenericDef, GenericSubstitution, HasCrate, HasSource, Semantics};
+use hir::{DisplayTarget, GenericDef, GenericSubstitution, HasSource, Semantics};
 use ide_db::{
     FileRange, FxIndexSet, Ranker, RootDatabase,
     defs::{Definition, IdentClass, NameRefClass, OperatorClass},
@@ -553,7 +553,10 @@ fn notable_traits<'db>(
         return Vec::new();
     }
 
-    ty.krate(db)
+    let Some(krate) = ty.krate(db) else {
+        return Vec::new();
+    };
+    krate
         .notable_traits_in_deps(db)
         .filter_map(move |&trait_| {
             let trait_ = trait_.into();
@@ -707,7 +710,9 @@ fn walk_and_push_ty(
         } else if let Some(trait_) = t.as_associated_type_parent_trait(db) {
             push_new_def(trait_.into());
         } else if let Some(tp) = t.as_type_param(db) {
-            let sized_trait = hir::Trait::lang(db, t.krate(db), hir::LangItem::Sized);
+            let sized_trait = t
+                .krate(db)
+                .and_then(|krate| hir::Trait::lang(db, krate, hir::LangItem::Sized));
             tp.trait_bounds(db)
                 .into_iter()
                 .filter(|&it| Some(it) != sized_trait)
