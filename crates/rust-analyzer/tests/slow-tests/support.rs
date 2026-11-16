@@ -225,6 +225,7 @@ impl Project<'_> {
                             lsp_types::ResourceOperationKind::Delete,
                             lsp_types::ResourceOperationKind::Rename,
                         ]),
+                        change_annotation_support: Some(Default::default()),
                         ..Default::default()
                     }),
                     semantic_tokens: Some(lsp_types::SemanticTokensWorkspaceClientCapabilities {

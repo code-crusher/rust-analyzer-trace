@@ -29,11 +29,12 @@ use lsp_types::{
     DocumentFormattingRequest, DocumentRangeFormattingParams, DocumentRangeFormattingRequest,
     FileRename, FormattingOptions, HoverParams, HoverRequest, InlayHint, InlayHintParams,
     InlayHintRequest, InlayHintResolveRequest, Label, LanguageKind, PartialResultParams, Position,
-    Range, RenameFilesParams, SemanticTokensDeltaParams, SemanticTokensDeltaRequest,
-    SemanticTokensParams, SemanticTokensRequest, TextDocumentContentChangeEvent,
-    TextDocumentContentChangeWholeDocument, TextDocumentItem, TextDocumentPositionParams,
-    TypeDefinitionParams, TypeDefinitionRequest, Uri, VersionedTextDocumentIdentifier,
-    WillRenameFilesRequest, WorkDoneProgressParams, WorkspaceSymbolRequest,
+    Range, RenameFilesParams, RenameParams, RenameRequest, SemanticTokensDeltaParams,
+    SemanticTokensDeltaRequest, SemanticTokensParams, SemanticTokensRequest,
+    TextDocumentContentChangeEvent, TextDocumentContentChangeWholeDocument, TextDocumentItem,
+    TextDocumentPositionParams, TypeDefinitionParams, TypeDefinitionRequest, Uri,
+    VersionedTextDocumentIdentifier, WillRenameFilesRequest, WorkDoneProgressParams,
+    WorkspaceSymbolRequest,
 };
 use rust_analyzer::lsp::ext::{OnEnterRequest, RunnablesParams, RunnablesRequest};
 use serde_json::json;
@@ -1480,6 +1481,57 @@ use crate::old_folder::nested::foo as bar;
               ]
             }
           ]
+        }),
+    );
+}
+
+#[test]
+fn rename_raw_identifier_does_not_drop_edits() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+pub struct r#pub;
+"#,
+    )
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    server.request::<RenameRequest>(
+        RenameParams {
+            new_name: "r#pub".to_owned(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: server.doc_id("src/lib.rs"),
+                position: Position { line: 0, character: 15 },
+            },
+        },
+        json!({
+            "documentChanges": [
+                {
+                    "textDocument": {
+                        "uri": server.doc_id("src/lib.rs").uri,
+                        "version": null
+                    },
+                    "edits": [
+                        {
+                            "range": {
+                                "start": { "line": 0, "character": 11 },
+                                "end": { "line": 0, "character": 16 }
+                            },
+                            "newText": "r#pub"
+                        }
+                    ]
+                }
+            ]
         }),
     );
 }

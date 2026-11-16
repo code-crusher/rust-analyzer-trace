@@ -258,6 +258,18 @@ struct r#pub {}
     }
 
     #[test]
+    fn fix_incorrect_raw_struct_name() {
+        check_fix(
+            r#"
+struct r#p$0ub {}
+"#,
+            r#"
+struct Pub {}
+"#,
+        );
+    }
+
+    #[test]
     fn no_diagnostic_for_camel_cased_acronyms_in_struct_name() {
         check_diagnostics(
             r#"

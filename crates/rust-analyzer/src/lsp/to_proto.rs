@@ -1,6 +1,6 @@
 //! Conversion of rust-analyzer specific types to lsp_types equivalents.
 use std::{
-    iter::once,
+    collections::HashMap,
     mem,
     ops::Not as _,
     sync::atomic::{AtomicU32, Ordering},
@@ -1485,15 +1485,41 @@ pub(crate) fn snippet_workspace_edit(
             document_changes.extend_from_slice(&ops);
         }
     }
-    let mut workspace_edit = lsp_ext::SnippetWorkspaceEdit {
-        changes: None,
-        document_changes: Some(document_changes),
-        change_annotations: None,
-    };
-    if snap.config.change_annotation_support() {
-        workspace_edit.change_annotations = Some(
-            once((
-                outside_workspace_annotation_id(),
+    let outside_workspace = outside_workspace_annotation_id();
+    let edits_outside_workspace = document_changes.iter().any(|op| match op {
+        lsp_ext::SnippetDocumentChangeOperation::Edit(it) => it
+            .edits
+            .iter()
+            .any(|edit| edit.annotation_id.as_deref() == Some(outside_workspace.as_str())),
+        lsp_ext::SnippetDocumentChangeOperation::Change(op) => match op {
+            lsp_types::DocumentChange::CreateFile(it) => {
+                it.annotation_id.as_deref() == Some(outside_workspace.as_str())
+            }
+            lsp_types::DocumentChange::RenameFile(it) => {
+                it.annotation_id.as_deref() == Some(outside_workspace.as_str())
+            }
+            lsp_types::DocumentChange::DeleteFile(it) => {
+                it.annotation_id.as_deref() == Some(outside_workspace.as_str())
+            }
+            lsp_types::DocumentChange::TextDocumentEdit(_) => false,
+        },
+    });
+    let annotations = source_change
+        .annotations
+        .into_iter()
+        .map(|(id, annotation)| {
+            (
+                id.to_string(),
+                lsp_types::ChangeAnnotation {
+                    label: annotation.label,
+                    description: annotation.description,
+                    needs_confirmation: Some(annotation.needs_confirmation),
+                },
+            )
+        })
+        .chain(edits_outside_workspace.then(|| {
+            (
+                outside_workspace,
                 lsp_types::ChangeAnnotation {
                     label: String::from("Edit outside of the workspace"),
                     needs_confirmation: Some(true),
@@ -1501,20 +1527,18 @@ pub(crate) fn snippet_workspace_edit(
                         "This edit lies outside of the workspace and may affect dependencies",
                     )),
                 },
-            ))
-            .chain(source_change.annotations.into_iter().map(|(id, annotation)| {
-                (
-                    id.to_string(),
-                    lsp_types::ChangeAnnotation {
-                        label: annotation.label,
-                        description: annotation.description,
-                        needs_confirmation: Some(annotation.needs_confirmation),
-                    },
-                )
-            }))
-            .collect(),
-        )
-    }
+            )
+        }))
+        .collect::<HashMap<_, _>>();
+    let workspace_edit = lsp_ext::SnippetWorkspaceEdit {
+        changes: None,
+        document_changes: Some(document_changes),
+        change_annotations: snap
+            .config
+            .change_annotation_support()
+            .then(|| annotations.is_empty().not().then_some(annotations))
+            .flatten(),
+    };
     Ok(workspace_edit)
 }
 
