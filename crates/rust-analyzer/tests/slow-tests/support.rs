@@ -418,6 +418,22 @@ impl Server {
         .unwrap_or_else(|Timeout| panic!("timeout while waiting for ws to load"));
         self
     }
+    /// Waits for a server status notification whose message contains `message`.
+    pub(crate) fn wait_for_server_status_message(&self, message: &str) {
+        self.wait_for_message_cond(1, &|msg: &Message| match msg {
+            Message::Notification(n) if n.method == "experimental/serverStatus" => n
+                .clone()
+                .extract::<lsp::ext::ServerStatusParams>("experimental/serverStatus")
+                .unwrap()
+                .message
+                .is_some_and(|it| it.contains(message)),
+            _ => false,
+        })
+        .unwrap_or_else(|Timeout| {
+            panic!("timeout while waiting for server status containing {message:?}")
+        });
+    }
+
     pub(crate) fn wait_for_diagnostics(&self) -> PublishDiagnosticsParams {
         for msg in self.messages.borrow().iter() {
             if let Message::Notification(n) = msg

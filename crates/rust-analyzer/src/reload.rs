@@ -539,6 +539,11 @@ impl GlobalState {
             // we don't care about build-script results, they are stale.
             // FIXME: can we abort the build scripts here if they are already running?
             self.workspaces = Arc::new(workspaces);
+            // The flycheck handles are tied to the workspaces they were created for, so they
+            // have to be recreated here. Note that this kills any in-flight check, which is why
+            // this must not happen for crate graph rebuilds that leave the workspaces intact
+            // (e.g. reloading proc macros after a proc-macro source file was saved).
+            self.reload_flycheck();
             self.check_workspaces_msrv().for_each(|message| {
                 self.send_notification::<lsp_types::ShowMessageNotification>(
                     lsp_types::ShowMessageParams { kind: lsp_types::MessageType::Warning, message },
@@ -826,7 +831,6 @@ impl GlobalState {
 
     pub(crate) fn finish_loading_crate_graph(&mut self) -> Option<Duration> {
         let (_, cancellation_time) = self.process_changes();
-        self.reload_flycheck();
         cancellation_time
     }
 

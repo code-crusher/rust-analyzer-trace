@@ -1,3 +1,8 @@
+use lsp_types::{
+    DidChangeTextDocumentNotification, DidChangeTextDocumentParams,
+    DidOpenTextDocumentNotification, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
+    TextDocumentContentChangeWholeDocument, TextDocumentItem, VersionedTextDocumentIdentifier,
+};
 use test_utils::skip_slow_tests;
 
 use crate::support::Project;
