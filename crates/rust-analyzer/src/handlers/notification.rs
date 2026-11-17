@@ -85,12 +85,8 @@ pub(crate) fn handle_did_open_text_document(
             return Ok(());
         }
 
-        // Library files are immutable: the client never becomes authoritative over their
-        // contents, disk is the truth.
-        if !state.source_root_config.path_is_library(&path) {
-            let contents = params.text_document.text.into_bytes();
-            state.vfs.write().0.set_file_contents(path, Some(contents));
-        }
+        let contents = params.text_document.text.into_bytes();
+        state.vfs.write().0.set_file_contents(path, Some(contents));
         if state.config.discover_workspace_config().is_some() {
             tracing::debug!("queuing task");
             let _ = state
@@ -125,10 +121,7 @@ pub(crate) fn handle_did_change_text_document(
         .into_bytes();
         if *data != new_contents {
             data.clone_from(&new_contents);
-            // Library files are immutable, changes to them are ignored.
-            if !state.source_root_config.path_is_library(&path) {
-                state.vfs.write().0.set_file_contents(path, Some(new_contents));
-            }
+            state.vfs.write().0.set_file_contents(path, Some(new_contents));
         }
     }
     Ok(())

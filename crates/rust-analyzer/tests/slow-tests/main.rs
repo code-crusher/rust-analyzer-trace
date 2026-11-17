@@ -1735,3 +1735,108 @@ version = "0.0.0"
         diagnostics.diagnostics,
     );
 }
+
+#[test]
+fn hover_over_edited_library_file() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    // Library roots are not watched on disk, so the only way the server learns about
+    // client-side edits is through the open/change notifications. Check that hovering the
+    // edited file yields ranges that match the edited text (see
+    // https://github.com/rust-lang/rust-analyzer/issues/23199).
+    //
+    // The sysroot library is the canonical library root, so hover `core::ptr::NonNull`.
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2021"
+
+//- /src/lib.rs
+pub struct App;
+"#,
+    )
+    .with_config(serde_json::json!({
+        "cargo": { "sysroot": "discover" },
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let sysroot = toolchain::command("rustc", cwd, &FxHashMap::default())
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("failed to run rustc --print sysroot");
+    let sysroot = String::from_utf8(sysroot.stdout).unwrap();
+    let non_null = std::path::Path::new(sysroot.trim())
+        .join("lib/rustlib/src/rust/library/core/src/ptr/non_null.rs");
+    assert!(non_null.exists(), "rust-src component is required for this test");
+    let doc = lsp_types::TextDocumentIdentifier {
+        uri: lsp_types::Uri::from_file_path(&non_null).unwrap(),
+    };
+    let original_text = std::fs::read_to_string(&non_null).unwrap();
+    let hover = |position| {
+        server.send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams::new(doc.clone(), position),
+            work_done_progress_params: Default::default(),
+        })
+    };
+
+    // Locate `pub struct NonNull` in the pristine on-disk source; the hovers below target
+    // the `NonNull` identifier.
+    let idx = original_text.find("pub struct NonNull").expect("NonNull struct should exist");
+    let struct_line = original_text[..idx].matches('\n').count();
+    let col = idx - original_text[..idx].rfind('\n').map_or(0, |line_start| line_start + 1)
+        + "pub struct ".len();
+    // Insert one and then two leading spaces in front of `pub`; previously these edits were
+    // dropped for library files, so ranges were computed against the stale on-disk text.
+    let one_space = format!("{} {}", &original_text[..idx], &original_text[idx..]);
+
+    server.notification::<DidOpenTextDocumentNotification>(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: doc.uri.clone(),
+            language_id: LanguageKind::Rust,
+            version: 0,
+            text: one_space,
+        },
+    });
+
+    let expected_start = col + 1;
+    let res = hover(Position::new(struct_line as u32, (expected_start + 1) as u32));
+    assert_eq!(
+        res["range"],
+        json!({
+            "start": { "line": struct_line, "character": expected_start },
+            "end": { "line": struct_line, "character": expected_start + "NonNull".len() },
+        }),
+        "hover range should match the edited file after didOpen, got: {res}"
+    );
+
+    // Prepend another space.
+    let with_two_spaces = format!("{}  {}", &original_text[..idx], &original_text[idx..]);
+
+    server.notification::<DidChangeTextDocumentNotification>(DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            text_document_identifier: doc.clone(),
+            version: 1,
+        },
+        content_changes: vec![
+            TextDocumentContentChangeWholeDocument { text: with_two_spaces }.into(),
+        ],
+    });
+
+    let expected_start = col + 2;
+    let res = hover(Position::new(struct_line as u32, (expected_start + 1) as u32));
+    assert_eq!(
+        res["range"],
+        json!({
+            "start": { "line": struct_line, "character": expected_start },
+            "end": { "line": struct_line, "character": expected_start + "NonNull".len() },
+        }),
+        "hover range should match the edited file after didChange, got: {res}"
+    );
+}
