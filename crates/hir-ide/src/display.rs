@@ -353,6 +353,34 @@ pub trait HirDisplay<'db> {
         module_id: ModuleId,
         allow_opaque: bool,
     ) -> Result<String, DisplaySourceCodeError> {
+        self.display_source_code_with_kind(
+            db,
+            DisplayKind::SourceCode { target_module_id: module_id, allow_opaque },
+        )
+    }
+
+    /// Returns a String representation of `self` that refers to every item by its canonical path,
+    /// ignoring names brought into scope by imports.
+    /// Use this for diagnostics that must disambiguate items whose short names collide, not for
+    /// generating code.
+    fn display_qualified_source_code<'a>(
+        &'a self,
+        db: &'db dyn HirDatabase,
+        module_id: ModuleId,
+    ) -> Result<String, DisplaySourceCodeError> {
+        self.display_source_code_with_kind(
+            db,
+            DisplayKind::SourceCodeIgnoreImports { target_module_id: module_id },
+        )
+    }
+
+    fn display_source_code_with_kind<'a>(
+        &'a self,
+        db: &'db dyn HirDatabase,
+        display_kind: DisplayKind,
+    ) -> Result<String, DisplaySourceCodeError> {
+        let module_id =
+            display_kind.source_code_module().expect("source code display kind must have a module");
         let mut result = String::new();
         let interner = DbInterner::new_with(db, module_id.krate(db));
         match self.hir_fmt(&mut HirFormatter {
@@ -366,7 +394,7 @@ pub trait HirDisplay<'db> {
             omit_verbose_types: false,
             closure_style: ClosureStyle::ImplFn,
             display_target: DisplayTarget::from_crate(db, module_id.krate(db)),
-            display_kind: DisplayKind::SourceCode { target_module_id: module_id, allow_opaque },
+            display_kind,
             show_container_bounds: false,
             render_private_fields: true,
             display_lifetimes: DisplayLifetime::OnlyNamedOrStatic,
@@ -438,6 +466,35 @@ impl<'db> HirFormatter<'_, 'db> {
 
     pub fn edition(&self) -> Edition {
         self.display_target.edition
+    }
+
+    /// Renders a trait name. In `DisplayKind::SourceCode` modes the name is rendered as a path
+    /// referring to the trait from the target module (like ADTs are), so the same short name can
+    /// be disambiguated; in the other modes just the plain name is rendered.
+    fn write_trait_name(&mut self, trait_: TraitId) -> Result {
+        if let Some(module_id) = self.display_kind.source_code_module()
+            && let Some(path) = find_path::find_path(
+                self.db,
+                ItemInNs::Types(ModuleDefId::TraitId(trait_)),
+                module_id,
+                PrefixKind::Plain,
+                self.display_kind.ignore_imports(),
+                // FIXME: no_std Cfg?
+                FindPathConfig {
+                    prefer_no_std: false,
+                    prefer_prelude: true,
+                    prefer_absolute: false,
+                    allow_unstable: true,
+                },
+            )
+        {
+            return write!(self, "{}", path.display(self.db, self.edition()));
+        }
+        write!(
+            self,
+            "{}",
+            TraitSignature::of(self.db, trait_).name.display(self.db, self.edition())
+        )
     }
 
     #[inline]
@@ -535,19 +592,38 @@ pub enum DisplayKind {
     /// Display types for inserting them in source files.
     /// The generated code should compile, so paths need to be qualified.
     SourceCode { target_module_id: ModuleId, allow_opaque: bool },
+    /// Like `SourceCode`, but paths ignore names brought into scope by imports, so items are
+    /// always referred to by their canonical path. Use this for diagnostics that need to
+    /// disambiguate items whose short names collide, not for generating code.
+    SourceCodeIgnoreImports { target_module_id: ModuleId },
     /// Only for test purpose to keep real types
     Test,
 }
 
 impl DisplayKind {
     fn is_source_code(self) -> bool {
-        matches!(self, Self::SourceCode { .. })
+        matches!(self, Self::SourceCode { .. } | Self::SourceCodeIgnoreImports { .. })
     }
 
     fn allows_opaque(self) -> bool {
         match self {
             Self::SourceCode { allow_opaque, .. } => allow_opaque,
+            // Diagnostics rendering opaque types as `impl Trait` bounds is fine, we only need
+            // the paths.
             _ => true,
+        }
+    }
+
+    fn ignore_imports(self) -> bool {
+        matches!(self, Self::SourceCodeIgnoreImports { .. })
+    }
+
+    /// Returns the module paths are resolved against, if this display kind resolves paths.
+    fn source_code_module(self) -> Option<ModuleId> {
+        match self {
+            Self::SourceCode { target_module_id, .. }
+            | Self::SourceCodeIgnoreImports { target_module_id } => Some(target_module_id),
+            _ => None,
         }
     }
 }
@@ -1465,13 +1541,15 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
                         };
                         write!(f, "{}", name.display(f.db, f.edition()))?;
                     }
-                    DisplayKind::SourceCode { target_module_id: module_id, allow_opaque: _ } => {
+                    DisplayKind::SourceCode { .. }
+                    | DisplayKind::SourceCodeIgnoreImports { .. } => {
+                        let module_id = f.display_kind.source_code_module().unwrap();
                         if let Some(path) = find_path::find_path(
                             db,
                             ItemInNs::Types(def_id.into()),
                             module_id,
                             PrefixKind::Plain,
-                            false,
+                            f.display_kind.ignore_imports(),
                             // FIXME: no_std Cfg?
                             FindPathConfig {
                                 prefer_no_std: false,
@@ -2137,7 +2215,7 @@ fn write_bounds_like_dyn_trait<'db>(
                 // existential) here, which is the only thing that's
                 // possible in actual Rust, and hence don't print it
                 f.start_location_link(trait_.into());
-                write!(f, "{}", TraitSignature::of(f.db, trait_).name.display(f.db, f.edition()))?;
+                f.write_trait_name(trait_)?;
                 f.end_location_link();
                 if is_fn_trait {
                     if let [_self, params @ ..] = trait_ref.trait_ref.args.as_slice()

@@ -57,10 +57,12 @@ pub(crate) fn type_mismatch(
         .with_closure_style(ClosureStyle::ClosureWithId)
         .to_string();
 
-    // The types differ (that's why we're here), yet they render the same, e.g. `foo::S` and
-    // `bar::S` both render as `S`. Retry with qualified paths so the message isn't a useless
-    // "expected S, found S".
-    let (expected, actual) = if expected == actual {
+    // The types differ (that's why we're here), yet they render the same or differ only in
+    // trait-object sugar, e.g. `foo::S` and `bar::S` both render as `S`, and
+    // `Result<T, dyn Error + 'static>` and `Result<T, io::Error>` render as
+    // `Result<T, dyn Error + 'static>` and `Result<T, Error>`. Retry with qualified paths so the
+    // message shows which item each name refers to.
+    let (expected, actual) = if renders_ambiguously(&expected, &actual) {
         qualified_display(ctx, d).unwrap_or((expected, actual))
     } else {
         (expected, actual)
@@ -86,9 +88,20 @@ fn qualified_display(
 ) -> Option<(String, String)> {
     let root = d.expr_or_pat.file_id.parse_or_expand(ctx.db());
     let module = ctx.sema.scope(d.expr_or_pat.value.to_node(&root).syntax())?.module();
-    let expected = d.expected.display_source_code(ctx.db(), module.into(), true).ok()?;
-    let actual = d.actual.display_source_code(ctx.db(), module.into(), true).ok()?;
+    let expected = d.expected.display_qualified_source_code(ctx.db(), module.into()).ok()?;
+    let actual = d.actual.display_qualified_source_code(ctx.db(), module.into()).ok()?;
     Some((expected, actual))
+}
+
+/// Checks whether the two rendered types are ambiguous, i.e. they are equal once
+/// trait-object sugar (`dyn` and the object lifetime bound it implies) is stripped, so the
+/// message can't show which item a name like `Error` refers to.
+fn renders_ambiguously(expected: &str, actual: &str) -> bool {
+    fn strip_trait_object_sugar(ty: &str) -> String {
+        ty.replace("dyn ", "").replace(" + 'static", "")
+    }
+
+    strip_trait_object_sugar(expected) == strip_trait_object_sugar(actual)
 }
 
 fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::TypeMismatch<'_>) -> Option<Vec<Assist>> {
@@ -2068,6 +2081,53 @@ fn make() -> Result<bar::T, qux::E> { loop {} }
 fn test(_: Result<foo::T, baz::E>) {
     test(make());
        //^^^^^^ error: expected Result<foo::T, baz::E>, found Result<bar::T, qux::E>
+}
+"#,
+        );
+    }
+
+    // The plain renderings differ only in the `dyn` sugar, so without qualified paths the
+    // message can't tell the two `Error`s apart (issue #23298).
+    #[test]
+    fn type_mismatch_collision_trait_and_struct() {
+        check_diagnostics(
+            r#"
+//- minicore: error, result
+use core::error::Error;
+
+mod io {
+    pub struct Error;
+}
+
+struct DirEntry;
+fn make() -> Result<DirEntry, io::Error> { loop {} }
+
+fn test() {
+    let _: &Result<DirEntry, Error> = &make();
+                                    //^^^^^^^ error: expected &Result<DirEntry, dyn core::error::Error + 'static>, found &Result<DirEntry, io::Error>
+}
+"#,
+        );
+    }
+
+    // The expected type spells the trait object out, so only the `dyn`/lifetime sugar and the
+    // short names differ from the found type.
+    #[test]
+    fn type_mismatch_collision_dyn_and_bare_trait() {
+        check_diagnostics(
+            r#"
+//- minicore: result
+mod foo {
+    pub trait Error {}
+}
+mod bar {
+    pub struct Error;
+}
+fn make() -> Result<(), bar::Error> { loop {} }
+
+fn test(x: &Result<(), dyn foo::Error>) {
+    test(&make());
+       //^^^^^^^ error: expected &Result<(), dyn foo::Error + 'static>, found &Result<(), bar::Error>
 }
 "#,
         );
