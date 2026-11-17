@@ -8,8 +8,8 @@ use rustc_next_trait_solver::{
     solve::{GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt},
 };
 use rustc_type_ir::{
-    Interner, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
-    inherent::IntoKind,
+    InferCtxtLike, Interner, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    inherent::{IntoKind, OpaqueTypeStorageEntries as _},
     solve::{Certainty, NoSolution},
 };
 
@@ -183,7 +183,38 @@ impl<'db> FulfillmentCtxt<'db> {
                     continue;
                 }
 
-                let result = delegate.evaluate_root_goal(goal, obligation.cause.span(), stalled_on);
+                // If we evaluated this goal before and it was stalled, check that
+                // nothing the goal depends on has changed. Otherwise, re-running the
+                // goal is wasteful: it will remain stalled and produce an identical
+                // result. This is the fast path inside of `evaluate_goal_raw`; we do
+                // it here before calling into the solver so that unaffected goals do
+                // not need to pay for the `EvaluatedGoal` setup.
+                let stalled = stalled_on
+                    .as_ref()
+                    .filter(|_| !infcx.disable_trait_solver_fast_paths())
+                    .filter(|stalled| {
+                        stalled
+                            .stalled_vars
+                            .iter()
+                            .all(|value| !infcx.is_changed_arg(*value))
+                            && stalled
+                                .sub_roots
+                                .iter()
+                                .all(|&vid| infcx.sub_unification_table_root_var(vid) == vid)
+                            && !infcx
+                                .opaque_types_storage_num_entries()
+                                .needs_reevaluation(stalled.num_opaques)
+                    })
+                    .cloned();
+                let result = match stalled {
+                    Some(stalled) => Ok(GoalEvaluation {
+                        goal,
+                        certainty: stalled.stalled_certainty,
+                        has_changed: HasChanged::No,
+                        stalled_on: Some(stalled),
+                    }),
+                    None => delegate.evaluate_root_goal(goal, obligation.cause.span(), stalled_on),
+                };
                 infcx.inspect_evaluated_obligation(&obligation, &result, || {
                     Some(
                         delegate.evaluate_root_goal_for_proof_tree(goal, obligation.cause.span()).1,

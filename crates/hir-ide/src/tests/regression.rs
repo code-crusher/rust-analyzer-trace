@@ -4,6 +4,8 @@ use expect_test::expect;
 
 use crate::tests::check;
 
+use test_utils::{bench, skip_slow_tests};
+
 use super::{check_infer, check_no_mismatches, check_types};
 
 #[test]
@@ -3208,4 +3210,36 @@ fn main() {
 }
     "#,
     );
+}
+
+
+/// Regression test for <https://github.com/rust-lang/rust-analyzer/issues/23217>:
+/// pending trait obligations that cannot make progress were re-evaluated on every
+/// `resolve_vars_with_obligations` call, which made inference on bodies with many
+/// expressions quadratic. This checks that a large function body still infers
+/// without quadratic behavior. See also the criterion-style benchmark in
+/// `rust-analyzer`'s test suite.
+#[test]
+fn regression_issue_23217_large_async_body() {
+    if skip_slow_tests() {
+        return;
+    }
+    let mut fixture = r#"//- minicore: async_fn
+struct Pair(u32, u32);
+impl Pair {
+    fn len(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+"#
+    .to_owned();
+    fixture.push_str("async fn async_body() {\n");
+    for i in 0..120 {
+        fixture.push_str(&format!("    let p{i} = Pair({i}, {i});\n    let l{i} = p{i}.len();\n"));
+    }
+    fixture.push_str("}\n");
+
+    let _b = bench("large async body");
+    check_no_mismatches(&fixture);
 }
