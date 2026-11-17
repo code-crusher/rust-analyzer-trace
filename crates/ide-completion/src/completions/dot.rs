@@ -97,20 +97,28 @@ pub(crate) fn complete_dot(
             .find_map(|ty| ty.into_iterator_iter(ctx.db))
             .map(|ty| (ty, SmolStr::new_static("iter()")));
         // Does <receiver_ty as IntoIterator>::IntoIter` exist?
-        let into_iter = || {
-            receiver_ty
-                .clone()
-                .into_iterator_iter(ctx.db)
-                .map(|ty| (ty, SmolStr::new_static("into_iter()")))
+        let into_iter = receiver_ty
+            .clone()
+            .into_iterator_iter(ctx.db)
+            .map(|ty| (ty, SmolStr::new_static("into_iter()")));
+        // Offer both `iter()` and `into_iter()` when both exist and lead to different
+        // iterator types (e.g. `Vec<T>`: `iter()` yields `&T`, `into_iter()` yields `T`).
+        // When they lead to the same type, offer only `iter()` to avoid duplicates.
+        let candidates = match (iter, into_iter) {
+            (Some(iter), Some(into_iter)) if iter.0 == into_iter.0 => vec![iter],
+            (Some(iter), Some(into_iter)) => vec![iter, into_iter],
+            (Some(iter), None) => vec![iter],
+            (None, Some(into_iter)) => vec![into_iter],
+            (None, None) => Vec::new(),
         };
-        if let Some((iter, iter_sym)) = iter.or_else(into_iter) {
-            // Skip iterators, e.g. complete `.iter().filter_map()`.
-            let dot_access_kind = match &dot_access.kind {
-                DotAccessKind::Field { receiver_is_ambiguous_float_literal: _ } => {
-                    DotAccessKind::Field { receiver_is_ambiguous_float_literal: false }
-                }
-                it @ DotAccessKind::Method => *it,
-            };
+        // Skip iterators, e.g. complete `.iter().filter_map()`.
+        let dot_access_kind = match &dot_access.kind {
+            DotAccessKind::Field { receiver_is_ambiguous_float_literal: _ } => {
+                DotAccessKind::Field { receiver_is_ambiguous_float_literal: false }
+            }
+            it @ DotAccessKind::Method => *it,
+        };
+        for (iter, iter_sym) in candidates {
             let dot_access = DotAccess {
                 receiver: dot_access.receiver.clone(),
                 receiver_ty: Some(hir::TypeInfo { original: iter.clone(), adjusted: None }),
@@ -1624,6 +1632,86 @@ fn baz() {
     foo.bar(${1:t})$0;
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn auto_iter() {
+        // Both paths exist and lead to different iterator types, so both are offered.
+        check_no_kw(
+            r#"
+//- minicore: iterator, clone
+struct Foo;
+impl Foo {
+    fn iter(&self) -> IterIter { IterIter }
+}
+impl IntoIterator for Foo {
+    type Item = ();
+    type IntoIter = ByValIter;
+    fn into_iter(self) -> Self::IntoIter { ByValIter }
+}
+impl<'a> IntoIterator for &'a Foo {
+    type Item = ();
+    type IntoIter = IterIter;
+    fn into_iter(self) -> Self::IntoIter { IterIter }
+}
+struct ByValIter;
+struct IterIter;
+impl Iterator for ByValIter {
+    type Item = ();
+    fn next(&mut self) -> Option<Self::Item> { None }
+}
+impl Iterator for IterIter {
+    type Item = ();
+    fn next(&mut self) -> Option<Self::Item> { None }
+}
+fn foo() {
+    Foo.$0
+}
+"#,
+            expect![[r#"
+                me into_iter() (as IntoIterator)                fn(self) -> <Self as IntoIterator>::IntoIter
+                me into_iter().by_ref() (as Iterator)                             fn(&mut self) -> &mut Self
+                me into_iter().next() (as Iterator)        fn(&mut self) -> Option<<Self as Iterator>::Item>
+                me into_iter().nth(…) (as Iterator) fn(&mut self, usize) -> Option<<Self as Iterator>::Item>
+                me iter()                                                              fn(&self) -> IterIter
+                me iter().by_ref() (as Iterator)                                  fn(&mut self) -> &mut Self
+                me iter().next() (as Iterator)             fn(&mut self) -> Option<<Self as Iterator>::Item>
+                me iter().nth(…) (as Iterator)      fn(&mut self, usize) -> Option<<Self as Iterator>::Item>
+            "#]],
+        );
+        // When only a shared reference can iterate, the `iter()` path and the
+        // by-value `into_iter()` path resolve to the same iterator type, so the
+        // iterator-trait methods are only offered once (via `iter()`).
+        check_no_kw(
+            r#"
+//- minicore: iterator, clone
+struct Foo;
+impl Foo {
+    fn iter(&self) -> IterIter { IterIter }
+}
+impl<'a> IntoIterator for &'a Foo {
+    type Item = ();
+    type IntoIter = IterIter;
+    fn into_iter(self) -> Self::IntoIter { IterIter }
+}
+struct IterIter;
+impl Iterator for IterIter {
+    type Item = ();
+    fn next(&mut self) -> Option<Self::Item> { None }
+}
+fn foo(f: &Foo) {
+    f.$0
+}
+"#,
+            expect![[r#"
+                me clone() (as Clone)                                                 fn(&self) -> Self
+                me into_iter() (as IntoIterator)           fn(self) -> <Self as IntoIterator>::IntoIter
+                me iter()                                                         fn(&self) -> IterIter
+                me iter().by_ref() (as Iterator)                             fn(&mut self) -> &mut Self
+                me iter().next() (as Iterator)        fn(&mut self) -> Option<<Self as Iterator>::Item>
+                me iter().nth(…) (as Iterator) fn(&mut self, usize) -> Option<<Self as Iterator>::Item>
+            "#]],
         );
     }
 
