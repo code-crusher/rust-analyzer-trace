@@ -189,6 +189,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "rust_analyzer" => match &*second_segment {
                         "completions" => extract_ra_completions(attr_flags, tt),
                         "macro_style" => extract_ra_macro_style(attr_flags, tt),
+                        "type_display" => attr_flags.insert(AttrFlags::HAS_TYPE_DISPLAY),
                         _ => {}
                     },
                     _ => {}
@@ -353,6 +354,8 @@ bitflags::bitflags! {
         const DIAGNOSTIC_DO_NOT_RECOMMEND = 1 << 51;
 
         const HAS_RUSTC_MUST_IMPLEMENT_ONE_OF = 1 << 52;
+
+        const HAS_TYPE_DISPLAY = 1 << 53;
     }
 }
 
@@ -566,6 +569,61 @@ pub struct RustcLayoutScalarValidRange {
 pub struct DeriveInfo {
     pub trait_name: Symbol,
     pub helpers: Box<[Symbol]>,
+}
+
+/// One parsed piece of a `#[rust_analyzer::type_display("...")]` template.
+///
+/// `Literal` is verbatim text; `Arg` is a `{N}` placeholder referring to the `N`th
+/// type-or-const generic argument of the item the attribute is on (lifetimes are skipped).
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum TypeDisplaySegment {
+    Literal(Box<str>),
+    Arg(u32),
+}
+
+/// Parses a type display template, returning `None` if it is malformed.
+///
+/// The syntax is `{N}` for the `N`th type-or-const generic argument and `{{`/`}}` for
+/// literal braces. Anything else inside braces makes the template invalid, in which case
+/// the attribute is ignored.
+fn parse_type_display(template: &str) -> Option<Box<[TypeDisplaySegment]>> {
+    let mut segments = Vec::new();
+    let mut literal = String::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                literal.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                literal.push('}');
+            }
+            '{' => {
+                let mut digits = String::new();
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    // `peek` does not consume, so `next` here always returns a digit.
+                    digits.push(chars.next().unwrap());
+                }
+                if digits.is_empty() || chars.next() != Some('}') {
+                    return None;
+                }
+                let index = digits.parse::<u32>().ok()?;
+                if !literal.is_empty() {
+                    segments.push(TypeDisplaySegment::Literal(literal.clone().into_boxed_str()));
+                    literal.clear();
+                }
+                segments.push(TypeDisplaySegment::Arg(index));
+            }
+            '}' => return None,
+            c => literal.push(c),
+        }
+    }
+    if !literal.is_empty() {
+        segments.push(TypeDisplaySegment::Literal(literal.into_boxed_str()));
+    }
+    Some(segments.into_boxed_slice())
 }
 
 fn extract_doc_aliases(result: &mut Vec<Symbol>, attr: ast::Meta) -> ControlFlow<Infallible> {
@@ -1251,6 +1309,53 @@ impl AttrFlags {
             })
         }
     }
+
+    /// The parsed `#[rust_analyzer::type_display("...")]` template of an item, if any.
+    ///
+    /// Malformed attributes are ignored without warnings.
+    pub fn type_display(
+        db: &dyn SourceDatabase,
+        owner: AttrDefId,
+    ) -> Option<&[TypeDisplaySegment]> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_TYPE_DISPLAY) {
+            // Don't create the query in case the attribute is not present, this wastes memory.
+            return None;
+        }
+
+        return type_display(db, owner);
+
+        #[salsa::tracked(returns(as_deref))]
+        fn type_display(
+            db: &dyn SourceDatabase,
+            owner: AttrDefId,
+        ) -> Option<Box<[TypeDisplaySegment]>> {
+            collect_attrs(db, owner, |attr| {
+                let ast::Meta::TokenTreeMeta(attr) = attr else {
+                    return ControlFlow::Continue(());
+                };
+                let Some((first_segment, second_segment)) = attr.path().as_up_to_two_segment()
+                else {
+                    return ControlFlow::Continue(());
+                };
+                if first_segment != "rust_analyzer"
+                    || second_segment.as_deref() != Some("type_display")
+                {
+                    return ControlFlow::Continue(());
+                }
+                let Some(tt) = attr.token_tree() else { return ControlFlow::Continue(()) };
+                let tt = TokenTreeChildren::new(&tt);
+                let Ok(NodeOrToken::Token(token)) = Itertools::exactly_one(tt) else {
+                    return ControlFlow::Continue(());
+                };
+                let Some(template) = ast::String::cast(token) else {
+                    return ControlFlow::Continue(());
+                };
+                let Ok(template) = template.value() else { return ControlFlow::Continue(()) };
+                ControlFlow::Break(parse_type_display(&template))
+            })
+            .flatten()
+        }
+    }
 }
 
 fn merge_repr(this: &mut ReprOptions, other: ReprOptions) {
@@ -1445,5 +1550,37 @@ mod tests {
         let module = db.module_for_file(file_id.file_id(&db));
         let attrs = AttrFlags::query(&db, AttrDefId::ModuleId(module));
         assert!(attrs.contains(AttrFlags::IS_NO_STD | AttrFlags::HAS_CFG));
+    }
+
+    #[test]
+    fn type_display_attribute() {
+        use crate::attrs::TypeDisplaySegment;
+        use crate::{AdtId, ModuleDefId, nameres::crate_def_map};
+
+        let fixture = r#"
+//- /lib.rs crate:foo
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity<Storage> {
+    value: Storage,
+}
+        "#;
+        let (db, file_id) = TestDB::with_single_file(fixture);
+        let module = db.module_for_file(file_id.file_id(&db));
+        let def_map = crate_def_map(&db, module.krate(&db));
+        let struct_id = def_map[def_map.root]
+            .scope
+            .declarations()
+            .find_map(|it| match it {
+                ModuleDefId::AdtId(AdtId::StructId(it)) => Some(it),
+                _ => None,
+            })
+            .unwrap();
+        let flags = AttrFlags::query(&db, struct_id.into());
+        assert!(flags.contains(AttrFlags::HAS_TYPE_DISPLAY));
+        let segments = AttrFlags::type_display(&db, struct_id.into()).unwrap();
+        assert_eq!(
+            segments,
+            &[TypeDisplaySegment::Arg(0), TypeDisplaySegment::Literal(" m".into()),][..]
+        );
     }
 }

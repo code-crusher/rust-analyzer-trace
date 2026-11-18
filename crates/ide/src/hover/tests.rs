@@ -842,6 +842,63 @@ fn foo(foo: Foo) {
 }
 
 #[test]
+fn hover_type_display_attribute() {
+    check(
+        r#"
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity<Storage> {
+    value: Storage,
+}
+
+fn f() {
+    let q: Quantity<f64>;
+    f(q$0);
+}
+
+fn f(_: Quantity<f64>) {}
+"#,
+        expect![[r#"
+            *q*
+
+            ```rust
+            let q: f64 m
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_type_display_attribute_on_definition() {
+    // The template only affects how the *type* is rendered; hovering the
+    // definition still shows the item itself.
+    check(
+        r#"
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity$0<Storage> {
+    value: Storage,
+}
+"#,
+        expect![[r#"
+            *Quantity*
+
+            ```rust
+            ra_test_fixture
+            ```
+
+            ```rust
+            struct Quantity<Storage> {
+                value: Storage,
+            }
+            ```
+
+            ---
+
+            type param may need Drop
+        "#]],
+    );
+}
+
+#[test]
 fn hover_tuple_struct() {
     check(
         r#"

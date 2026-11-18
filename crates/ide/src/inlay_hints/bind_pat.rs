@@ -220,6 +220,30 @@ fn main() {
     }
 
     #[test]
+    fn type_hints_custom_type_display() {
+        // The custom template must not break label parts with location links,
+        // including when a generic argument is itself a type with a template.
+        check_types(
+            r#"
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity<Storage> {
+    value: Storage,
+}
+
+#[rust_analyzer::type_display("<{0}>")]
+struct Wrap<T>(T);
+
+fn main() {
+    let x = Wrap(Quantity { value: 1.0 });
+      //^ <f64 m>
+    let y = Quantity { value: 1.0 };
+      //^ f64 m
+}
+"#,
+        );
+    }
+
+    #[test]
     fn type_hints_end_of_line_placement() {
         let mut config = InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG };
         config.type_hints_placement = TypeHintsPlacement::EndOfLine;

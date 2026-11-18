@@ -3965,6 +3965,191 @@ async fn foo(a: (), b: i32) -> u32 {
 }
 
 #[test]
+fn tool_attr_type_display() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity<Storage> {
+    value: Storage,
+}
+
+fn f() {
+    let q: Quantity<f64>;
+    q;
+} //^ f64 m
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_multiple_args_and_literals() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display("Quantity {{ {0}, {1} }}")]
+struct Quantity<Storage, Dim> {
+    value: Storage,
+}
+
+struct Meter;
+
+fn f() {
+    let q: Quantity<f64, Meter>;
+    q;
+} //^ Quantity { f64, Meter }
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_skips_lifetimes() {
+    // `{0}` refers to the first type-or-const argument, not to `'a` which comes
+    // first in the substitution.
+    check_types(
+        r#"
+#[rust_analyzer::type_display("&'static {0}")]
+struct Ref<'a, T>(&'a T);
+
+fn f() {
+    let r: Ref<'static, u8>;
+    r;
+} //^ &'static u8
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_const_generic() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display("[{0}; {1}]")]
+struct Array<T, const N: usize>([T; N]);
+
+fn f() {
+    let a: Array<f64, 3>;
+    a;
+} //^ [f64; 3]
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_nested_and_recursive() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity<Storage> {
+    value: Storage,
+}
+
+#[rust_analyzer::type_display("<{0}>")]
+struct Wrap<T>(T);
+
+fn f() {
+    let q: Quantity<Quantity<Wrap<f64>>>;
+    q;
+} //^ <f64> m m
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_on_enum() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display("{0}!")]
+enum E<T> {
+    A(T),
+}
+
+fn f() {
+    let e: E<u8>;
+    e;
+} //^ u8!
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_on_union() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display("{0} and {0}")]
+union U<T> {
+    a: T,
+}
+
+fn f() {
+    let u: U<u8>;
+    u;
+} //^ u8 and u8
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_out_of_range_placeholder() {
+    // A placeholder with no corresponding argument is echoed verbatim.
+    check_types(
+        r#"
+#[rust_analyzer::type_display("{0} {1}")]
+struct S<T>(T);
+
+fn f() {
+    let s: S<u8>;
+    s;
+} //^ u8 {1}
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_malformed_is_ignored() {
+    check_types(
+        r#"
+#[rust_analyzer::type_display(42)]
+struct A<T>(T);
+#[rust_analyzer::type_display()]
+struct B<T>(T);
+#[rust_analyzer::type_display("{x}")]
+struct C<T>(T);
+#[rust_analyzer::type_display("{0")]
+struct D<T>(T);
+#[rust_analyzer::type_display = "{0}"]
+struct E<T>(T);
+#[rust_analyzer::type_display("}")]
+struct F<T>(T);
+
+fn f() {
+    let a: A<u8>;
+    a;
+} //^ A<u8>
+        "#,
+    );
+}
+
+#[test]
+fn tool_attr_type_display_across_crates() {
+    // The attribute is shipped by the library crate and applies to its users.
+    check_types(
+        r#"
+//- /main.rs crate:main deps:quantity
+use quantity::Quantity;
+
+fn f() {
+    let q: Quantity<f64>;
+    q;
+} //^ f64 m
+
+//- /quantity.rs crate:quantity
+#[rust_analyzer::type_display("{0} m")]
+pub struct Quantity<Storage> {
+    pub value: Storage,
+}
+        "#,
+    );
+}
+
+#[test]
 fn irrefutable_slices() {
     check_infer(
         r#"

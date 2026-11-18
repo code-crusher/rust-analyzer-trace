@@ -278,3 +278,21 @@ fn test() {
 "#,
     );
 }
+
+#[test]
+fn type_display_attribute_is_ignored_in_source_code() {
+    // The template is meant for humans, not for generated code.
+    check_types_source_code(
+        r#"
+#[rust_analyzer::type_display("{0} m")]
+struct Quantity<Storage> {
+    value: Storage,
+}
+
+fn f() {
+    let q: Quantity<f64>;
+    q;
+} //^ Quantity<f64>
+        "#,
+    );
+}

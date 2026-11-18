@@ -10,8 +10,9 @@ use std::{
 use base_db::{Crate, FxIndexMap};
 use either::Either;
 use hir_def::{
-    CallableDefId, ExpressionStoreOwnerId, FindPathConfig, GenericDefId, GenericParamId, HasModule,
-    ItemContainerId, LocalFieldId, Lookup, ModuleDefId, ModuleId, TraitId, TypeAliasId,
+    AttrDefId, CallableDefId, ExpressionStoreOwnerId, FindPathConfig, GenericDefId, GenericParamId,
+    HasModule, ItemContainerId, LocalFieldId, Lookup, ModuleDefId, ModuleId, TraitId, TypeAliasId,
+    attrs::TypeDisplaySegment,
     expr_store::{ExpressionStore, path::Path},
     find_path::{self, PrefixKind},
     hir::{
@@ -1453,6 +1454,15 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
             }
             TyKind::Adt(def, parameters) => {
                 let def_id = def.def_id();
+                if !f.display_kind.is_source_code()
+                    && let Some(segments) =
+                        hir_def::attrs::AttrFlags::type_display(f.db, AttrDefId::AdtId(def_id))
+                {
+                    // The custom template replaces the name and the generic arguments. It is not
+                    // wrapped in a location link, so that generic arguments that resolve to
+                    // another ADT can still link to it (links cannot nest).
+                    return render_type_display(f, segments, parameters.as_slice());
+                }
                 f.start_location_link(def_id.into());
                 match f.display_kind {
                     DisplayKind::Diagnostics | DisplayKind::Test => {
@@ -1969,6 +1979,50 @@ fn hir_fmt_tys<'db>(
         match self_ {
             Some(self_) if *ty == self_ => write!(f, "Self")?,
             _ => ty.hir_fmt(f)?,
+        }
+    }
+    Ok(())
+}
+
+// Feature: Custom Type Rendering Attribute
+//
+// Crate authors can tell rust-analyzer to render a type differently, by placing
+// the attribute `#[rust_analyzer::type_display("...")]` on it. The string is a template
+// in which `{0}`, `{1}`, ... are replaced by the corresponding type-or-const generic
+// argument of the type (lifetimes are skipped), and `{{`/`}}` are literal braces. For
+// example, a units-of-measure crate could declare
+//
+// ```
+// #[rust_analyzer::type_display("Quantity<{0}, {{m}}")]
+// struct Quantity<Storage, Dim> { ... }
+// ```
+//
+// and hovering over a `Quantity<f64, Meter>` would show `Quantity<f64, {m}>` instead.
+// This is only used when displaying types to the user (hover, inlay hints, diagnostics),
+// not when generating source code (e.g. assists), which must compile.
+//
+// Malformed attributes are ignored without warnings.
+//
+// ![Hover](https://user-images.githubusercontent.com/48062697/113020658-b5f98b80-917a-11eb-9f88-3dbc27320c95.gif)
+fn render_type_display<'db>(
+    f: &mut HirFormatter<'_, 'db>,
+    segments: &[TypeDisplaySegment],
+    parameters: &[GenericArg<'db>],
+) -> Result {
+    for segment in segments {
+        match segment {
+            // Write literals through `write!` so that they count towards truncation.
+            TypeDisplaySegment::Literal(literal) => write!(f, "{literal}")?,
+            TypeDisplaySegment::Arg(index) => {
+                let arg =
+                    parameters.iter().filter(|arg| arg.region().is_none()).nth(*index as usize);
+                match arg {
+                    Some(arg) => arg.hir_fmt(f)?,
+                    // The template refers to a nonexistent argument; echo the placeholder so the
+                    // mistake is visible instead of silently dropping text.
+                    None => write!(f, "{{{index}}}")?,
+                }
+            }
         }
     }
     Ok(())
