@@ -397,4 +397,55 @@ struct X$0 {
 
         assert_eq!(ml_a.to_string(), ml_b.to_string());
     }
+
+    #[test]
+    fn view_memory_layout_union_of_boxes() {
+        // Regression test for https://github.com/rust-lang/rust-analyzer/issues/23067:
+        // the layout of this B-tree node type used to be reported as 136 bytes
+        // (rustc says 128) because `Option<NonNull<Node<T>>>` failed to be
+        // niche-optimized into an 8-byte pointer-sized field.
+        expect![[r#"
+            [ROOT]: Node<T> (size: 128, align: 8, field offset: 0)
+            	children: NodeChildren<T> (size: 56, align: 8, field offset: 0)
+            		nodes: [ManuallyDrop<Box<Node<T>>>; TREE_ORDER] (size: 56, align: 8, field offset: 0)
+            		leaves: [ManuallyDrop<Box<Leaf<T>>>; TREE_ORDER] (size: 56, align: 8, field offset: 0)
+            	parent: Option<NonNull<Node<T>>> (size: 8, align: 8, field offset: 56)
+            	keys: [usize; TREE_MAX_KEYS] (size: 48, align: 8, field offset: 64)
+            	num_keys: usize (size: 8, align: 8, field offset: 112)
+            	depth: usize (size: 8, align: 8, field offset: 120)
+        "#]]
+        .assert_eq(
+            &make_memory_layout(
+                r#"
+//- minicore: sized, manually_drop, non_null, non_zero, option, pat
+use core::{mem::ManuallyDrop, ptr::NonNull};
+
+struct Box<T>(*mut T);
+
+const TREE_ORDER: usize = 7;
+const TREE_MAX_KEYS: usize = 6;
+
+struct Leaf<T> {
+    inner: [T; 3],
+}
+
+union NodeChildren<T> {
+    nodes: [ManuallyDrop<Box<Node<T>>>; TREE_ORDER],
+    leaves: [ManuallyDrop<Box<Leaf<T>>>; TREE_ORDER],
+}
+
+#[repr(C)]
+struct Node$0<T> {
+    children: NodeChildren<T>,
+    parent: Option<NonNull<Node<T>>>,
+    keys: [usize; TREE_MAX_KEYS],
+    num_keys: usize,
+    depth: usize,
+}
+"#,
+            )
+            .unwrap()
+            .to_string(),
+        );
+    }
 }

@@ -706,6 +706,71 @@ fn enums_with_discriminants() {
 }
 
 #[test]
+fn union_of_boxes_in_generic_struct() {
+    // Regression test for https://github.com/rust-lang/rust-analyzer/issues/23067:
+    // a B-tree node with a union of arrays of `ManuallyDrop<Box<_>>` and a
+    // recursive `Option<NonNull<Node<T>>>` parent pointer used to be laid out
+    // as 136 bytes instead of 128 (`parent` failing to be niche-optimized).
+    size_and_align! {
+        minicore: sized, manually_drop, non_zero, non_null, option;
+        use core::{mem::ManuallyDrop, ptr::NonNull};
+
+        struct Box<T>(*mut T);
+
+        const TREE_ORDER: usize = 7;
+        const TREE_MAX_KEYS: usize = 6;
+
+        struct Leaf<T> {
+            inner: [T; 3],
+        }
+
+        union NodeChildren<T> {
+            nodes: [ManuallyDrop<Box<Node<T>>>; TREE_ORDER],
+            leaves: [ManuallyDrop<Box<Leaf<T>>>; TREE_ORDER],
+        }
+
+        #[repr(C)]
+        struct Node<T> {
+            children: NodeChildren<T>,
+            parent: Option<NonNull<Node<T>>>,
+            keys: [usize; TREE_MAX_KEYS],
+            num_keys: usize,
+            depth: usize,
+        }
+
+        struct Goal(Node<u8>);
+    }
+    size_and_align! {
+        minicore: sized, manually_drop, non_zero, non_null, option;
+        use core::{mem::ManuallyDrop, ptr::NonNull};
+
+        struct Box<T>(*mut T);
+
+        const TREE_ORDER: usize = 7;
+        const TREE_MAX_KEYS: usize = 6;
+
+        struct Leaf<T> {
+            inner: [T; 3],
+        }
+
+        union NodeChildren<T> {
+            nodes: [ManuallyDrop<Box<Node<T>>>; TREE_ORDER],
+            leaves: [ManuallyDrop<Box<Leaf<T>>>; TREE_ORDER],
+        }
+
+        struct Node<T> {
+            children: NodeChildren<T>,
+            keys: [usize; TREE_MAX_KEYS],
+            parent: Option<NonNull<Node<T>>>,
+            num_keys: usize,
+            depth: usize,
+        }
+
+        struct Goal(Node<u8>);
+    }
+}
+
+#[test]
 fn core_mem_discriminant() {
     size_and_align! {
         minicore: discriminant;

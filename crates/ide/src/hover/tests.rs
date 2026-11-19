@@ -12324,3 +12324,61 @@ const FOO$0: () = main();
         "#]],
     );
 }
+
+#[test]
+fn hover_union_of_boxes_layout() {
+    // Regression test for https://github.com/rust-lang/rust-analyzer/issues/23067.
+    // Hovering a field of this B-tree node type used to report the layout of
+    // `Node` as 136 bytes instead of 128 (the `parent` field's
+    // `Option<NonNull<Node<T>>>` failed to be niche-optimized to 8 bytes).
+    // Field hover intentionally shows no size line for generic ADT fields
+    // (their layout depends on generic parameters), so this guards that
+    // hover stays well-formed for this recursive type.
+    check(
+        r#"
+//- minicore: sized, manually_drop, non_null, non_zero, option, pat
+use core::{mem::ManuallyDrop, ptr::NonNull};
+
+const TREE_ORDER: usize = 7;
+const TREE_MAX_KEYS: usize = 6;
+
+struct Leaf<T> {
+    inner: [T; 3],
+}
+
+union NodeChildren<T> {
+    nodes: [ManuallyDrop<Box<Node<T>>>; TREE_ORDER],
+    leaves: [ManuallyDrop<Box<Leaf<T>>>; TREE_ORDER],
+}
+
+#[repr(C)]
+struct Node<T> {
+    children: NodeChildren<T>,
+    parent: Option<NonNull<Node<T>>>,
+    keys: [usize; TREE_MAX_KEYS],
+    num_keys: usize,
+    depth: usize,
+}
+
+fn main() {
+    let x: Node<()> = loop {};
+    let _ = x.parent$0;
+}
+"#,
+        expect![[r#"
+            *parent*
+
+            ```rust
+            ra_test_fixture::Node
+            ```
+
+            ```rust
+            parent: Option<NonNull<Node<T>>>
+            ```
+
+            ---
+
+            `T` = `()`
+        "#]],
+    );
+}
