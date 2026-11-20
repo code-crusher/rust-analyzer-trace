@@ -17,6 +17,7 @@ mod item_list;
 mod pattern;
 mod predicate;
 mod proc_macros;
+mod scratch_22884;
 mod raw_identifiers;
 mod record;
 mod special;
