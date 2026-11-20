@@ -282,6 +282,21 @@ pub(crate) fn check_diagnostics_with_config(
 }
 
 #[test]
+fn regression_22975() {
+    // `_ = foo;` uses `foo`, so it must not be reported as unused. This used to be a false
+    // positive when the MIR-based `unused_variables` diagnostic existed: lowering aborted at the
+    // diverging `loop {}` initializer, so the usage was never visited.
+    check_diagnostics(
+        r#"
+fn main() {
+    let foo = loop {};
+    _ = foo; // used
+}
+"#,
+    );
+}
+
+#[test]
 fn test_disabled_diagnostics() {
     let mut config = DiagnosticsConfig::test_sample();
     config.disabled.insert("E0583".into());
