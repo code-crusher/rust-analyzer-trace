@@ -35,8 +35,11 @@ use hir::{MacroCallId, Name};
 use ide_db::text_edit::TextEdit;
 use ide_db::traits::IsRequiredAssocItem;
 use ide_db::{
-    SymbolKind, documentation::HasDocs, path_transform::PathTransform,
-    syntax_helpers::prettify_macro_expansion, traits::get_missing_assoc_items,
+    SymbolKind,
+    documentation::HasDocs,
+    path_transform::PathTransform,
+    syntax_helpers::prettify_macro_expansion,
+    traits::{get_missing_assoc_items, strip_unstable_const_trait_syntax},
 };
 use syntax::ast::HasGenericParams;
 use syntax::syntax_editor::{Position, SyntaxEditor};
@@ -305,6 +308,7 @@ fn get_transformed_assoc_item(
     let assoc_item = ast::AssocItem::cast(transform.apply(assoc_item.syntax()))?;
     let (editor, assoc_item) = SyntaxEditor::with_ast_node(&assoc_item);
     assoc_item.remove_attrs_and_docs(&editor);
+    strip_unstable_const_trait_syntax(&assoc_item, &editor);
     let transformed = editor.finish().new_root().clone();
 
     let prettied = if let Some(macro_file) = macro_file {
@@ -338,6 +342,7 @@ fn get_transformed_fn(
     let (editor, fn_) = SyntaxEditor::with_ast_node(&fn_);
     let factory = editor.make();
     fn_.remove_attrs_and_docs(&editor);
+    strip_unstable_const_trait_syntax(&ast::AssocItem::Fn(fn_.clone()), &editor);
     match async_ {
         AsyncSugaring::Desugar => {
             match fn_.ret_type() {
@@ -1792,6 +1797,90 @@ trait DesugaredAsyncTrait {
 
 impl DesugaredAsyncTrait for () {
     async fn foo(&self) -> usize {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn skip_const_trait_bounds() {
+        check_edit(
+            "fn fold",
+            r#"
+struct Foo;
+trait Iterator {
+    type Item;
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized + [const] Destruct,
+        F: [const] FnMut(B, Self::Item) -> B + [const] Destruct,
+    {
+        loop {}
+    }
+}
+impl Iterator for Foo {
+    fol$0
+}
+"#,
+            r#"
+struct Foo;
+trait Iterator {
+    type Item;
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized + [const] Destruct,
+        F: [const] FnMut(B, Self::Item) -> B + [const] Destruct,
+    {
+        loop {}
+    }
+}
+impl Iterator for Foo {
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+where
+    Self: Sized,
+    F: FnMut(B, Self::Item) -> B,
+{
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn skip_const_trait_bounds_destruct_only_pred() {
+        check_edit(
+            "fn unwrap_or",
+            r#"
+struct Foo;
+trait Option {
+    fn unwrap_or<E: [const] Destruct>(self, default: Self) -> Self
+    where
+        Self: ~const Destruct,
+        E: ~const Destruct,
+    {
+        loop {}
+    }
+}
+impl Option for Foo {
+    unwrap_$0
+}
+"#,
+            r#"
+struct Foo;
+trait Option {
+    fn unwrap_or<E: [const] Destruct>(self, default: Self) -> Self
+    where
+        Self: ~const Destruct,
+        E: ~const Destruct,
+    {
+        loop {}
+    }
+}
+impl Option for Foo {
+    fn unwrap_or<E>(self, default: Self) -> Self {
     $0
 }
 }

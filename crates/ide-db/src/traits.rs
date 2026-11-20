@@ -3,7 +3,13 @@
 use crate::{RootDatabase, defs::Definition};
 use base_db::FxIndexMap;
 use hir::{AsAssocItem, HasAttrs, HasCrate, Semantics, db::HirDatabase, sym};
-use syntax::{AstNode, ast};
+use syntax::{
+    AstNode,
+    SyntaxKind::WHITESPACE,
+    T,
+    ast::{self, HasTypeBounds},
+    syntax_editor::{Removable, SyntaxEditor},
+};
 
 /// Given the `impl` block, attempts to find the trait this `impl` corresponds to.
 pub fn resolve_target_trait(
@@ -156,6 +162,172 @@ fn diff_assoc_items(
     }
 
     trait_items.into_values().collect()
+}
+
+/// Strips unstable const trait syntax that is only usable in `std` from an
+/// associated item about to be inserted into a trait impl.
+///
+/// The standard library uses bounds like `Self: Sized + [const] Destruct` in
+/// the `Iterator` trait, which rust-analyzer would otherwise copy verbatim into
+/// the impl. `[const]`/`~const` bounds are gated on `#![feature(const_trait_impl)]`
+/// and only allowed in `const` contexts, and the [`Destruct`] lang item trait is
+/// itself unstable and cannot be implemented by user code at all, so neither can
+/// appear in a (non-`const`) impl. We therefore strip the `const` modifiers of
+/// bounds and remove `Destruct` bounds entirely.
+///
+/// [`Destruct`]: hir::LangItem::Destruct
+pub fn strip_unstable_const_trait_syntax(item: &ast::AssocItem, editor: &SyntaxEditor) {
+    // Where clauses need special care: one whose predicates all have to go is
+    // removed wholesale instead of predicate by predicate, which would
+    // otherwise leave a dangling `where` behind.
+    for where_clause in item.syntax().descendants().filter_map(ast::WhereClause::cast) {
+        let preds: Vec<_> = where_clause.predicates().collect();
+        if !preds.is_empty() && preds.iter().all(pred_is_destruct_only) {
+            remove_where_clause(&where_clause, editor);
+        } else {
+            for pred in &preds {
+                if pred_is_destruct_only(pred) {
+                    remove_where_pred(pred, editor);
+                } else if let Some(bound_list) = pred.type_bound_list() {
+                    strip_bound_list(&bound_list, editor);
+                }
+            }
+        }
+    }
+
+    // Bound lists outside of where clauses, e.g. in generic parameter lists.
+    for bound_list in item.syntax().descendants().filter_map(ast::TypeBoundList::cast) {
+        let in_where_pred = bound_list
+            .syntax()
+            .parent()
+            .is_some_and(|parent| ast::WherePred::can_cast(parent.kind()));
+        if !in_where_pred {
+            strip_bound_list(&bound_list, editor);
+        }
+    }
+}
+
+/// Whether this is a bound on the (unstable, std-only) `Destruct` marker trait,
+/// e.g. `[const] core::marker::Destruct`.
+fn bound_is_destruct(bound: &ast::TypeBound) -> bool {
+    fn last_segment_name(path: &ast::Path) -> Option<ast::NameRef> {
+        // `Path` nests qualifiers (`core::marker::Destruct` is
+        // `Path { qualifier: Path { qualifier: Path, segment: marker }, segment: Destruct }`),
+        // so the last segment is the one without a qualifier.
+        let mut segment = path.segment()?;
+        while let Some(qualifier) = path.qualifier() {
+            segment = qualifier.segment()?;
+        }
+        segment.name_ref()
+    }
+
+    matches!(bound.ty(), Some(ast::Type::PathType(ty)) if ty
+        .path()
+        .and_then(|path| last_segment_name(&path))
+        .is_some_and(|name| name.text() == "Destruct"))
+}
+
+/// Whether every bound of this where predicate is on the `Destruct` marker
+/// trait, e.g. `Self: [const] Destruct`.
+fn pred_is_destruct_only(pred: &ast::WherePred) -> bool {
+    let bounds: Vec<_> = pred.type_bound_list().iter().flat_map(|it| it.bounds()).collect();
+    !bounds.is_empty() && bounds.iter().all(bound_is_destruct)
+}
+
+/// Strips `const` modifiers and `Destruct` bounds from the bounds of a bound
+/// list that is not part of a where clause; a list consisting solely of
+/// `Destruct` bounds is removed entirely, together with its `:`.
+fn strip_bound_list(bound_list: &ast::TypeBoundList, editor: &SyntaxEditor) {
+    let bounds: Vec<_> = bound_list.bounds().collect();
+    if !bounds.is_empty() && bounds.iter().all(bound_is_destruct) {
+        bound_list.remove(editor);
+        return;
+    }
+    for bound in bounds {
+        if bound_is_destruct(&bound) {
+            remove_bound_with_separator(&bound, editor);
+        } else {
+            strip_const_modifier(&bound, editor);
+        }
+    }
+}
+
+/// Strips a `const`/`~const`/`[const]` modifier off a type bound, e.g. turns
+/// `[const] FnMut(..)` into `FnMut(..)`.
+fn strip_const_modifier(bound: &ast::TypeBound, editor: &SyntaxEditor) {
+    let Some(const_token) = bound.const_token().or_else(|| bound.tilde_token()) else { return };
+    // Extend to a leading `[` or `~`.
+    let start = const_token
+        .prev_sibling_or_token()
+        .filter(|prev| prev.kind() == T!['['] || prev.kind() == T![~])
+        .unwrap_or_else(|| const_token.clone().into());
+    let end = bound.r_brack_token().unwrap_or_else(|| const_token.clone());
+    editor.delete_all(start..=end.clone().into());
+    if let Some(ws) = end.next_sibling_or_token().filter(|it| it.kind() == WHITESPACE) {
+        editor.delete(ws);
+    }
+}
+
+/// Removes a bound together with the `+` separator connecting it to its
+/// neighbors, e.g. turns `Sized + Destruct + Copy` into `Sized + Copy`.
+fn remove_bound_with_separator(bound: &ast::TypeBound, editor: &SyntaxEditor) {
+    let syntax = bound.syntax();
+    // The elements of a bound list are laid out like `<bound> <ws>+ <ws> <bound>`,
+    // so a separator (plus the whitespace around it) sits between two bounds.
+    // Prefer the separator *in front of* the bound so that a trailing bound does
+    // not leave `Sized ,` behind.
+    let prev = || {
+        syntax.prev_sibling_or_token().filter(|it| it.kind() == WHITESPACE).and_then(|ws| {
+            let plus = ws.prev_sibling_or_token().filter(|it| it.kind() == T![+])?;
+            let start =
+                plus.prev_sibling_or_token().filter(|it| it.kind() == WHITESPACE).unwrap_or(plus);
+            Some(start)
+        })
+    };
+    let (start, end) = match prev() {
+        Some(start) => (start, syntax.clone().into()),
+        // The bound is the first one, take the separator behind it instead.
+        None => {
+            let mut end = syntax.clone().into();
+            if let Some(ws) = syntax.next_sibling_or_token().filter(|it| it.kind() == WHITESPACE)
+                && let Some(plus) = ws.next_sibling_or_token().filter(|it| it.kind() == T![+])
+            {
+                end = plus
+                    .next_sibling_or_token()
+                    .filter(|it| it.kind() == WHITESPACE)
+                    .unwrap_or(plus);
+            }
+            (syntax.clone().into(), end)
+        }
+    };
+    editor.delete_all(start..=end);
+}
+
+/// Removes a where predicate along with its leading whitespace and trailing
+/// comma, e.g. `where Self: Sized, T: [const] Destruct, U: Clone` becomes
+/// `where Self: Sized, U: Clone`.
+fn remove_where_pred(pred: &ast::WherePred, editor: &SyntaxEditor) {
+    let syntax = pred.syntax();
+    let start = syntax
+        .prev_sibling_or_token()
+        .filter(|it| it.kind() == WHITESPACE)
+        .unwrap_or_else(|| syntax.clone().into());
+    let end = syntax
+        .next_sibling_or_token()
+        .filter(|it| it.kind() == T![,])
+        .unwrap_or_else(|| syntax.clone().into());
+    editor.delete_all(start..=end);
+}
+
+/// Removes a where clause, e.g. turns `fn f() where Self: [const] Destruct {}`
+/// into `fn f() {}`.
+fn remove_where_clause(where_clause: &ast::WhereClause, editor: &SyntaxEditor) {
+    let syntax = where_clause.syntax();
+    let start = syntax
+        .prev_sibling_or_token()
+        .filter(|it| it.kind() == WHITESPACE)
+        .unwrap_or_else(|| syntax.clone().into());
+    editor.delete_all(start..=syntax.clone().into());
 }
 
 /// Converts associated trait impl items to their trait definition counterpart

@@ -13,7 +13,7 @@ use ide_db::{
     famous_defs::FamousDefs,
     path_transform::PathTransform,
     syntax_helpers::{node_ext::preorder_expr, prettify_macro_expansion},
-    traits::IsRequiredAssocItem,
+    traits::{IsRequiredAssocItem, strip_unstable_const_trait_syntax},
 };
 use itertools::Itertools;
 use syntax::{
@@ -266,6 +266,7 @@ pub fn add_trait_assoc_items_to_impl(
             }
             let (editor, cloned_item) = SyntaxEditor::with_ast_node(&cloned_item);
             cloned_item.remove_attrs_and_docs(&editor);
+            strip_unstable_const_trait_syntax(&cloned_item, &editor);
             ast::AssocItem::cast(editor.finish().new_root().clone()).unwrap()
         })
         .filter_map(|item| match item {

@@ -3120,4 +3120,87 @@ impl Foo for () {
         "#,
         );
     }
+
+    #[test]
+    fn strip_const_trait_bounds() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- minicore: sized
+trait Iterator {
+    type Item;
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized + [const] Destruct,
+        F: [const] FnMut(B, Self::Item) -> B + [const] Destruct;
+}
+
+struct Foo;
+
+impl Iterator for Foo {
+    $0
+}
+"#,
+            r#"
+trait Iterator {
+    type Item;
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized + [const] Destruct,
+        F: [const] FnMut(B, Self::Item) -> B + [const] Destruct;
+}
+
+struct Foo;
+
+impl Iterator for Foo {
+    $0type Item;
+
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B {
+        todo!()
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn strip_const_trait_bounds_destruct_only_pred() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- minicore: sized
+trait Option {
+    fn unwrap_or<E: [const] Destruct>(self, default: Self) -> Self
+    where
+        Self: ~const Destruct,
+        E: ~const Destruct;
+}
+
+struct Foo;
+
+impl Option for Foo {
+    $0
+}
+"#,
+            r#"
+trait Option {
+    fn unwrap_or<E: [const] Destruct>(self, default: Self) -> Self
+    where
+        Self: ~const Destruct,
+        E: ~const Destruct;
+}
+
+struct Foo;
+
+impl Option for Foo {
+    fn unwrap_or<E>(self, default: Self) -> Self {
+        ${0:todo!()}
+    }
+}
+"#,
+        );
+    }
 }
