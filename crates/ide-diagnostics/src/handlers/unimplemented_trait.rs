@@ -112,4 +112,73 @@ fn baz() {
         "#,
         );
     }
+
+    #[test]
+    fn regression_22979() {
+        // `<impl Parser as Parser>::PartialState: Default` used to be reported as
+        // unsatisfied here: the bound comes from the where clause of the `Parser`
+        // trait, which applies to its `PartialState` associated type, and used to be
+        // dropped when checking the hidden type of the `impl Parser` return type.
+        check_diagnostics(
+            r#"
+//- minicore: default, phantom_data
+trait ParseError {
+    type StreamError;
+}
+
+impl<T> ParseError for T {
+    type StreamError = ();
+}
+
+trait Stream {
+    type Item;
+    type Error: ParseError;
+}
+
+trait Parser
+where
+    <Self as Parser>::PartialState: Default,
+{
+    type PartialState;
+    fn parse_mode(_: &Self, _: Self::PartialState) {
+        loop {}
+    }
+}
+
+impl Stream for () {
+    type Item = ();
+    type Error = ();
+}
+
+impl Parser for () {
+    type PartialState = ();
+}
+
+struct AndThen<A, B>(core::marker::PhantomData<(A, B)>);
+
+impl<A, B> Parser for AndThen<A, B>
+where
+    A: Stream,
+    B: Into<<A::Error as ParseError>::StreamError>,
+{
+    type PartialState = ();
+}
+
+fn expr<A>() -> impl Parser
+where
+    A: Stream<Error = <A as Stream>::Item>,
+{
+    AndThen::<A, ()>(core::marker::PhantomData)
+}
+
+fn parse_mode_impl<A>()
+where
+    <A as Stream>::Error: ParseError,
+    A: Stream<Error = <A as Stream>::Item>,
+{
+    Parser::parse_mode(&expr::<A>(), Default::default())
+}
+        "#,
+        );
+    }
 }
