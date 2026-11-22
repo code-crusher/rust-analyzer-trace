@@ -60,7 +60,7 @@ use hir_def::{
     expr_store::ExpressionStore,
     hir::{
         BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, LabelId, Pat,
-        generics::{GenericParams, LifetimeParamData, TypeOrConstParamData, TypeParamProvenance},
+        generics::{GenericParams, TypeOrConstParamData, TypeParamProvenance},
     },
     item_tree::ImportAlias,
     lang_item::LangItemTarget,
@@ -1215,24 +1215,6 @@ impl Adt {
             Adt::Union(u) => u.name(db),
             Adt::Enum(e) => e.name(db),
         }
-    }
-
-    /// Returns the lifetime of the DataType
-    pub fn lifetime(&self, db: &dyn HirDatabase) -> Option<LifetimeParamData> {
-        let resolver = match self {
-            Adt::Struct(s) => s.id.resolver(db),
-            Adt::Union(u) => u.id.resolver(db),
-            Adt::Enum(e) => e.id.resolver(db),
-        };
-        resolver
-            .generic_params()
-            .and_then(|gp| {
-                gp.iter_early_bound_lt()
-                    // there should only be a single lifetime
-                    // but `Arena` requires to use an iterator
-                    .nth(0)
-            })
-            .map(|arena| arena.1.clone())
     }
 
     pub fn as_struct(&self) -> Option<Struct> {
@@ -5335,20 +5317,67 @@ impl<'db> Type<'db> {
             })
     }
 
-    /// Combines lifetime indicators, type and constant parameters into a single `Iterator`
+    /// Iterates its lifetime arguments
+    ///
+    /// It iterates the actual lifetime arguments when concrete lifetimes are
+    /// used and otherwise elided ones.
+    ///
+    /// For code, such as:
+    /// ```text
+    /// struct Foo<'a, 'b>
+    ///
+    /// impl<'a> Foo<'a, 'static>
+    /// ```
+    ///
+    /// It iterates:
+    /// ```text
+    /// - "'a"
+    /// - "'static"
+    /// ```
+    pub fn lifetime_arguments<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+        display_target: DisplayTarget,
+    ) -> impl Iterator<Item = SmolStr> + 'a {
+        self.ty
+            .skip_binder()
+            .strip_references()
+            .as_adt()
+            .into_iter()
+            .flat_map(|(_, substs)| substs.iter())
+            .filter_map(move |arg| match arg.kind() {
+                rustc_type_ir::GenericArgKind::Lifetime(lt) => {
+                    Some(format_smolstr!("{}", lt.display(db, display_target)))
+                }
+                _ => None,
+            })
+    }
+
+    /// Combines lifetime, type and const arguments into a single `Iterator`
+    ///
+    /// It iterates the actual arguments when concrete arguments are used
+    /// and otherwise the generic names.
+    ///
+    /// For code, such as:
+    /// ```text
+    /// struct Foo<'a, T, const U: usize>
+    ///
+    /// impl<T> Foo<'a, T, 12>
+    /// ```
+    ///
+    /// It iterates:
+    /// ```text
+    /// - "'a"
+    /// - "T"
+    /// - "12"
+    /// ```
     pub fn generic_parameters<'a>(
         &'a self,
         db: &'a dyn HirDatabase,
         display_target: DisplayTarget,
     ) -> impl Iterator<Item = SmolStr> + 'a {
-        // iterate the lifetime
-        self.as_adt()
-            .and_then(|a| {
-                // Lifetimes do not need edition-specific handling as they cannot be escaped.
-                a.lifetime(db).map(|lt| lt.name.display_no_db(Edition::Edition2015).to_smolstr())
-            })
-            .into_iter()
-            // add the type and const parameters
+        // iterate the lifetimes, then the type and const parameters
+        self.lifetime_arguments(db, display_target)
             .chain(self.type_and_const_arguments(db, display_target))
     }
 

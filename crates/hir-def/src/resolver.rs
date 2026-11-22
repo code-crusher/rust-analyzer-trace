@@ -764,13 +764,6 @@ impl<'db> Resolver<'db> {
         })
     }
 
-    pub fn generic_params(&self) -> Option<&GenericParams> {
-        self.scopes().find_map(|scope| match scope {
-            &Scope::GenericParams { params, .. } => Some(params),
-            _ => None,
-        })
-    }
-
     pub fn all_generic_params(&self) -> impl Iterator<Item = (&GenericParams, GenericDefId)> {
         self.scopes().filter_map(|scope| match scope {
             &Scope::GenericParams { params, def } => Some((params, def)),

@@ -270,6 +270,38 @@ fn main() {
     }
 
     #[test]
+    fn test_assoc_func_fix_with_lifetime() {
+        check_fix(
+            r#"
+struct A<'a> {
+    a: &'a ()
+}
+
+impl<'b> A<'b> {
+    fn foo() {}
+}
+fn main() {
+    let a = A {a: &()};
+    a.foo()$0;
+}
+"#,
+            r#"
+struct A<'a> {
+    a: &'a ()
+}
+
+impl<'b> A<'b> {
+    fn foo() {}
+}
+fn main() {
+    let a = A {a: &()};
+    A::<'_>::foo();
+}
+"#,
+        );
+    }
+
+    #[test]
     fn smoke_test() {
         check_diagnostics(
             r#"

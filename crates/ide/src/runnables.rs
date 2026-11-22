@@ -739,7 +739,7 @@ impl UpdateTest {
 mod tests {
     use expect_test::{Expect, expect};
 
-    use crate::fixture;
+    use crate::{RunnableKind, fixture};
 
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let (analysis, position) = fixture::position(ra_fixture);
@@ -749,6 +749,11 @@ mod tests {
             .into_iter()
             .map(|runnable| {
                 let mut a = format!("({:?}, {:?}", runnable.kind.disc(), runnable.nav);
+                // The doctest id doubles as the filter passed to `cargo test`,
+                // so assert on it to catch regressions in how it is computed.
+                if let RunnableKind::DocTest { test_id } = &runnable.kind {
+                    a.push_str(&format!(", doctest_id: {test_id}"));
+                }
                 if runnable.use_name_in_title {
                     a.push_str(", true");
                 }
@@ -914,14 +919,14 @@ impl Test for StructWithRunnable {}
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 15..74, name: \"should_have_runnable\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 76..148, name: \"should_have_runnable_1\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 150..254, name: \"should_have_runnable_2\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 256..320, name: \"should_have_no_runnable_3\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 322..398, name: \"should_have_no_runnable_4\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 900..965, name: \"StructWithRunnable\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 967..1024, focus_range: 1003..1021, name: \"impl\", kind: Impl })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 1088..1154, focus_range: 1133..1151, name: \"impl\", kind: Impl })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 15..74, name: \"should_have_runnable\" }, doctest_id: should_have_runnable)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 76..148, name: \"should_have_runnable_1\" }, doctest_id: should_have_runnable_1)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 150..254, name: \"should_have_runnable_2\" }, doctest_id: should_have_runnable_2)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 256..320, name: \"should_have_no_runnable_3\" }, doctest_id: should_have_no_runnable_3)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 322..398, name: \"should_have_no_runnable_4\" }, doctest_id: should_have_no_runnable_4)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 900..965, name: \"StructWithRunnable\" }, doctest_id: StructWithRunnable)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 967..1024, focus_range: 1003..1021, name: \"impl\", kind: Impl }, doctest_id: StructWithRunnable)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 1088..1154, focus_range: 1133..1151, name: \"impl\", kind: Impl }, doctest_id: StructWithRunnable)",
                 ]
             "#]],
         );
@@ -946,7 +951,7 @@ impl Data {
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 44..98, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 44..98, name: \"foo\" }, doctest_id: Data::foo)",
                 ]
             "#]],
         );
@@ -961,7 +966,7 @@ $0
 fn main() {}
 
 struct Data<'a>;
-impl Data<'a> {
+impl<'a> Data<'a> {
     /// ```
     /// let x = 5;
     /// ```
@@ -971,7 +976,7 @@ impl Data<'a> {
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 52..106, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 56..110, name: \"foo\" }, doctest_id: Data<'a>::foo)",
                 ]
             "#]],
         );
@@ -986,7 +991,7 @@ $0
 fn main() {}
 
 struct Data<'a, T, U>;
-impl<T, U> Data<'a, T, U> {
+impl<'a, T, U> Data<'a, T, U> {
     /// ```
     /// let x = 5;
     /// ```
@@ -996,7 +1001,7 @@ impl<T, U> Data<'a, T, U> {
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 70..124, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 74..128, name: \"foo\" }, doctest_id: Data<'a,T,U>::foo)",
                 ]
             "#]],
         );
@@ -1021,7 +1026,7 @@ impl<const N: usize> Data<N> {
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 79..133, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 79..133, name: \"foo\" }, doctest_id: Data<N>::foo)",
                 ]
             "#]],
         );
@@ -1046,11 +1051,75 @@ impl<'a, T, const N: usize> Data<'a, T, N> {
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 100..154, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 100..154, name: \"foo\" }, doctest_id: Data<'a,T,N>::foo)",
                 ]
             "#]],
         );
     }
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_multiple_lifetimes() {
+        check(
+            r#"
+//- /lib.rs
+$0
+struct Foo<'a, 'b>(&'a (), &'b ());
+
+impl<'a, 'b> Foo<'a, 'b> {
+    /// ```
+    /// let _ = "Hello, world!";
+    /// ```
+    fn method(self) {
+        unimplemented!()
+    }
+}
+"#,
+            expect![[r#"
+                [
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 69..174, name: \"method\" }, doctest_id: Foo<'a,'b>::method)",
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_renamed_and_concrete_lifetimes() {
+        check(
+            r#"
+//- /lib.rs
+$0
+struct Foo<'a, 'b>(&'a (), &'b ());
+
+impl<'x, 'y> Foo<'x, 'y> {
+    /// ```
+    /// let _ = 1;
+    /// ```
+    fn foo(self) {}
+}
+
+impl Foo<'static, 'static> {
+    /// ```
+    /// let _ = 1;
+    /// ```
+    fn bar(self) {}
+}
+
+impl Foo<'_, '_> {
+    /// ```
+    /// let _ = 1;
+    /// ```
+    fn baz(self) {}
+}
+"#,
+            expect![[r#"
+                [
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 69..127, name: \"foo\" }, doctest_id: Foo<'x,'y>::foo)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 164..222, name: \"bar\" }, doctest_id: Foo<'static,'static>::bar)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 249..307, name: \"baz\" }, doctest_id: Foo<'_,'_>::baz)",
+                ]
+            "#]],
+        );
+    }
+
     #[test]
     fn test_runnables_module() {
         check(
@@ -1182,7 +1251,7 @@ impl Foo {
         "#,
             expect![[r#"
                 [
-                    "(DocTest, NavigationTarget { file_id: FileId(1), full_range: 27..81, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(1), full_range: 27..81, name: \"foo\" }, doctest_id: foo::Foo::foo)",
                 ]
             "#]],
         );
@@ -1525,7 +1594,7 @@ $0
 fn main() {}
 
 struct Data<'a, A, const B: usize, C, const D: u32>;
-impl<A, C, const D: u32> Data<'a, A, 12, C, D> {
+impl<'a, A, C, const D: u32> Data<'a, A, 12, C, D> {
     /// ```
     /// ```
     fn foo() {}
@@ -1534,7 +1603,7 @@ impl<A, C, const D: u32> Data<'a, A, 12, C, D> {
             expect![[r#"
                 [
                     "(Bin, NavigationTarget { file_id: FileId(0), full_range: 1..13, focus_range: 4..8, name: \"main\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 121..156, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 125..160, name: \"foo\" }, doctest_id: Data<'a,A,12,C,D>::foo)",
                 ]
             "#]],
         );
@@ -1566,10 +1635,10 @@ impl Foo<Foo<(), ()>, ()> {
 "#,
             expect![[r#"
                 [
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 20..103, focus_range: 47..56, name: \"impl\", kind: Impl })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 63..101, name: \"t\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 105..188, focus_range: 126..146, name: \"impl\", kind: Impl })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 153..186, name: \"t\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 20..103, focus_range: 47..56, name: \"impl\", kind: Impl }, doctest_id: Foo<T,U>)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 63..101, name: \"t\" }, doctest_id: Foo<T,U>::t)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 105..188, focus_range: 126..146, name: \"impl\", kind: Impl }, doctest_id: Foo<Foo<(),()>,()>)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 153..186, name: \"t\" }, doctest_id: Foo<Foo<(),()>,()>::t)",
                 ]
             "#]],
         );
@@ -1616,7 +1685,7 @@ macro_rules! foo {
 "#,
             expect![[r#"
                 [
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 1..94, name: \"foo\" })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 1..94, name: \"foo\" }, doctest_id: foo)",
                 ]
             "#]],
         );
@@ -1666,12 +1735,12 @@ mod r#mod {
                 [
                     "(TestMod, NavigationTarget { file_id: FileId(0), full_range: 1..461, focus_range: 5..10, name: \"mod\", kind: Module, description: \"mod r#mod\" })",
                     "(Test, NavigationTarget { file_id: FileId(0), full_range: 17..41, focus_range: 32..36, name: \"r#fn\", kind: Function })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 47..84, name: \"for\", container_name: \"mod\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 90..146, name: \"struct\", container_name: \"mod\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 152..266, focus_range: 189..205, name: \"impl\", kind: Impl })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 216..260, name: \"fn\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 323..367, name: \"fn\" })",
-                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 401..459, focus_range: 445..456, name: \"impl\", kind: Impl })",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 47..84, name: \"for\", container_name: \"mod\" }, doctest_id: r#mod::r#for)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 90..146, name: \"struct\", container_name: \"mod\" }, doctest_id: r#mod::r#struct)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 152..266, focus_range: 189..205, name: \"impl\", kind: Impl }, doctest_id: r#struct<r#type>)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 216..260, name: \"fn\" }, doctest_id: r#mod::r#struct<r#type>::r#fn)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 323..367, name: \"fn\" }, doctest_id: r#mod::r#struct<r#enum>::r#fn)",
+                    "(DocTest, NavigationTarget { file_id: FileId(0), full_range: 401..459, focus_range: 445..456, name: \"impl\", kind: Impl }, doctest_id: r#struct<T>)",
                 ]
             "#]],
         )
