@@ -638,6 +638,32 @@ pub struct Goal(core::pattern_type!(i32 is ..0 | 1..));
     );
 }
 
+/// Regression test for #22871: the layout of `core::num::NonZero<i32>` was not computed because
+/// its pattern type is an exclusive range (`..0`), and computing the range's end goes through
+/// `RangePattern::sub_one` -> `checked_sub` -> `sub_with_overflow`, whose shim used to report a
+/// bogus overflow for signed operands.
+#[test]
+fn non_zero_i32_pattern_type() {
+    check_size_and_align(
+        r#"
+pub trait ZeroablePrimitive: Sized + Copy {
+    type NonZeroInner: Sized + Copy;
+}
+impl ZeroablePrimitive for i32 {
+    type NonZeroInner = NonZeroI32Inner;
+}
+#[repr(transparent)]
+pub struct NonZeroI32Inner(core::pattern_type!(i32 is ..0 | 1..));
+#[repr(transparent)]
+pub struct NonZero<T: ZeroablePrimitive>(T::NonZeroInner);
+pub struct Goal(NonZero<i32>);
+    "#,
+        "//- minicore: pat\n",
+        4,
+        4,
+    );
+}
+
 #[test]
 fn niche_optimization() {
     size_and_align! {

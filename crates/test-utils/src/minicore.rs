@@ -2326,6 +2326,9 @@ pub mod pat {
         };
     }
 
+    #[rustc_intrinsic]
+    pub fn sub_with_overflow<T>(x: T, y: T) -> (T, bool);
+
     pub const trait RangePattern {
         #[lang = "RangeMin"]
         const MIN: Self;
@@ -2341,10 +2344,12 @@ pub mod pat {
         const MIN: u8 = 0;
         const MAX: u8 = 0xFF;
         fn sub_one(self) -> Self {
-            if self == Self::MIN {
+            // Mirrors `core`'s `checked_sub(1)`.
+            let (val, overflow) = sub_with_overflow(self, 1);
+            if overflow {
                 panic!("exclusive range end at minimum value of type")
             } else {
-                self - 1
+                val
             }
         }
     }
@@ -2353,10 +2358,12 @@ pub mod pat {
         const MIN: i32 = 0x80_00_00_00;
         const MAX: i32 = 0x7F_FF_FF_FF;
         fn sub_one(self) -> Self {
-            if self == Self::MIN {
+            // Mirrors `core`'s `checked_sub(1)`.
+            let (val, overflow) = sub_with_overflow(self, 1);
+            if overflow {
                 panic!("exclusive range end at minimum value of type")
             } else {
-                self - 1
+                val
             }
         }
     }

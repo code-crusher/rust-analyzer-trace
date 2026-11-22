@@ -3184,7 +3184,7 @@ macro_rules! for_each_int_type {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum IntValue {
+pub(super) enum IntValue {
     I8(i8),
     U8(u8),
     I16(i16),
@@ -3202,6 +3202,20 @@ macro_rules! checked_int_op {
         fn $op(self, other: Self) -> Option<Self> {
             match (self, other) {
                 $( (Self::$int_ty(a), Self::$int_ty(b)) => a.$op(b).map(Self::$int_ty), )+
+                _ => panic!("incompatible integer types"),
+            }
+        }
+    };
+}
+
+macro_rules! overflowing_int_op {
+    ( [ $op:ident ] $( $int_ty:ident )+ ) => {
+        fn $op(self, other: Self) -> (Self, bool) {
+            match (self, other) {
+                $( (Self::$int_ty(a), Self::$int_ty(b)) => {
+                    let (result, overflow) = a.$op(b);
+                    (Self::$int_ty(result), overflow)
+                } )+
                 _ => panic!("incompatible integer types"),
             }
         }
@@ -3276,6 +3290,10 @@ impl IntValue {
     for_each_int_type!(checked_int_op, [checked_div]);
     for_each_int_type!(checked_int_op, [checked_rem]);
     for_each_int_type!(checked_int_op, [checked_mul]);
+
+    for_each_int_type!(overflowing_int_op, [overflowing_add]);
+    for_each_int_type!(overflowing_int_op, [overflowing_sub]);
+    for_each_int_type!(overflowing_int_op, [overflowing_mul]);
 
     for_each_int_type!(int_bit_shifts, [checked_shl]);
     for_each_int_type!(int_bit_shifts, [checked_shr]);

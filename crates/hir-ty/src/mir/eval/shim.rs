@@ -11,7 +11,7 @@ use stdx::never;
 use crate::{
     drop::{DropGlue, has_drop_glue},
     mir::eval::{
-        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
+        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, IntValue, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, from_bytes, not_supported, pad16,
     },
@@ -956,26 +956,24 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     self.interner(),
                     [lhs.ty, Ty::new_bool(self.interner())].into_iter(),
                 );
-                let op_size = self.size_of_sized(lhs.ty, locals, "operand of add_with_overflow")?;
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let (ans, u128overflow) = match name {
+                // Arithmetic is performed at the operand's own width so that both the wrapped
+                // result and the overflow flag are exact for signed and unsigned types alike.
+                let is_signed = matches!(lhs.ty.kind(), TyKind::Int(_));
+                let lhs = IntValue::from_bytes(lhs.get(self)?, is_signed);
+                let rhs = IntValue::from_bytes(rhs.get(self)?, is_signed);
+                let (ans, is_overflow) = match name {
                     "add_with_overflow" => lhs.overflowing_add(rhs),
                     "sub_with_overflow" => lhs.overflowing_sub(rhs),
                     "mul_with_overflow" => lhs.overflowing_mul(rhs),
                     _ => unreachable!(),
                 };
-                let is_overflow = u128overflow
-                    || ans.to_le_bytes()[op_size..].iter().any(|&it| it != 0 && it != 255);
                 let is_overflow = vec![u8::from(is_overflow)];
                 let layout = self.layout(result_ty)?;
                 let result = self.construct_with_layout(
                     layout.size.bytes_usize(),
                     &layout,
                     None,
-                    [ans.to_le_bytes()[0..op_size].to_vec(), is_overflow]
-                        .into_iter()
-                        .map(IntervalOrOwned::Owned),
+                    [ans.to_bytes(), is_overflow].into_iter().map(IntervalOrOwned::Owned),
                 )?;
                 destination.write_from_bytes(self, &result)
             }
