@@ -127,7 +127,7 @@ pub(super) fn transcribe(
     marker: impl Fn(&mut Span) + Copy,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let mut ctx = ExpandCtx { bindings, nesting: Vec::new(), call_site };
+    let mut ctx = ExpandCtx { bindings, nesting: Vec::new(), call_site, in_macro_args: false };
     let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(ctx.call_site));
     expand_subtree(&mut ctx, template, &mut builder, marker).map(|()| builder.build())
 }
@@ -148,6 +148,19 @@ struct ExpandCtx<'a> {
     bindings: &'a Bindings<'a>,
     nesting: Vec<NestingState>,
     call_site: Span,
+    /// Whether we are currently expanding the argument list of a nested macro
+    /// invocation in the template, e.g. the `($val)` in `inner!($val)`.
+    ///
+    /// `rustc` keeps matched `expr` fragments opaque: when an expansion is fed
+    /// into another macro invocation, a fragment matches `tt`-like metavariables
+    /// as a single token tree, never plain token patterns. We don't have
+    /// interpolated tokens, so to mimic that opacity we wrap single-token
+    /// `expr` fragments in parentheses in this position (multi-token fragments
+    /// are always parenthesized, as they must be for precedence). Without this,
+    /// macros that distinguish user input from their own literal tokens by
+    /// relying on that opacity (e.g. bitvec's `__encode_bits!`, see issue
+    /// #22877) match the wrong arm.
+    in_macro_args: bool,
 }
 
 fn expand_subtree_with_delimiter(
@@ -164,6 +177,18 @@ fn expand_subtree_with_delimiter(
     result
 }
 
+/// How the ops emitted so far end, used to recognize a nested macro invocation
+/// `<path> ! <delimited args>` in the template. See `ExpandCtx::in_macro_args`.
+#[derive(Debug, PartialEq)]
+enum MacroCallState {
+    /// The emitted ops do not end in a macro path.
+    None,
+    /// The ops end in a path that could name a macro.
+    Path,
+    /// The ops end in `<path> !`.
+    Bang,
+}
+
 fn expand_subtree(
     ctx: &mut ExpandCtx<'_>,
     template: &MetaTemplate,
@@ -171,19 +196,34 @@ fn expand_subtree(
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<()> {
     let mut err = None;
+    // Tracks whether the ops emitted so far end in `<macro path> !`, so that the
+    // delimited subtree that follows is recognized as that invocation's
+    // argument list. See `ExpandCtx::in_macro_args`.
+    let mut prev_is_macro_call = MacroCallState::None;
     'ops: for op in template.iter() {
         match op {
-            Op::Literal(it) => builder.push(tt::Leaf::from({
-                let mut it = it.clone();
-                marker(&mut it.span);
-                it
-            })),
-            Op::Ident(it) => builder.push(tt::Leaf::from({
-                let mut it = it.clone();
-                marker(&mut it.span);
-                it
-            })),
+            Op::Literal(it) => {
+                prev_is_macro_call = MacroCallState::None;
+                builder.push(tt::Leaf::from({
+                    let mut it = it.clone();
+                    marker(&mut it.span);
+                    it
+                }))
+            }
+            Op::Ident(it) => {
+                prev_is_macro_call = MacroCallState::Path;
+                builder.push(tt::Leaf::from({
+                    let mut it = it.clone();
+                    marker(&mut it.span);
+                    it
+                }))
+            }
             Op::Punct(puncts) => {
+                // Only `!` directly after the macro path starts a macro invocation.
+                prev_is_macro_call = match (prev_is_macro_call, puncts.last()) {
+                    (MacroCallState::Path, Some(it)) if it.char == '!' => MacroCallState::Bang,
+                    _ => MacroCallState::None,
+                };
                 builder.extend(puncts.iter().map(|punct| {
                     tt::Leaf::from({
                         let mut it = *punct;
@@ -193,24 +233,36 @@ fn expand_subtree(
                 }));
             }
             Op::Subtree { tokens, delimiter } => {
+                let is_macro_args = prev_is_macro_call == MacroCallState::Bang;
+                prev_is_macro_call = MacroCallState::None;
                 let mut delimiter = *delimiter;
                 marker(&mut delimiter.open);
                 marker(&mut delimiter.close);
+                let prev_in_macro_args = std::mem::replace(
+                    &mut ctx.in_macro_args,
+                    is_macro_args && delimiter.kind != tt::DelimiterKind::Invisible,
+                );
                 let ExpandResult { value: (), err: e } =
                     expand_subtree_with_delimiter(ctx, tokens, builder, Some(delimiter), marker);
+                ctx.in_macro_args = prev_in_macro_args;
                 err = err.or(e);
             }
             Op::Var { name, id, .. } => {
-                let ExpandResult { value: (), err: e } =
+                // A `$m:path` variable can name a macro, so let `expand_var` decide.
+                let ExpandResult { value: is_path, err: e } =
                     expand_var(ctx, name, *id, builder, marker);
+                prev_is_macro_call =
+                    if is_path { MacroCallState::Path } else { MacroCallState::None };
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
+                prev_is_macro_call = MacroCallState::None;
                 let ExpandResult { value: (), err: e } =
                     expand_repeat(ctx, subtree, *kind, separator.as_deref(), builder, marker);
                 err = err.or(e);
             }
             Op::Ignore { name, id } => {
+                prev_is_macro_call = MacroCallState::None;
                 // Expand the variable, but ignore the result. This registers the repetition count.
                 let e = ctx.bindings.get_fragment(name, *id, &mut ctx.nesting, marker).err();
                 // FIXME: The error gets dropped if there were any previous errors.
@@ -219,6 +271,7 @@ fn expand_subtree(
                 err = err.or(e);
             }
             Op::Index { depth } => {
+                prev_is_macro_call = MacroCallState::None;
                 let index =
                     ctx.nesting.get(ctx.nesting.len() - 1 - depth).map_or(0, |nest| nest.idx);
                 builder.push(tt::Leaf::Literal(tt::Literal {
@@ -229,6 +282,7 @@ fn expand_subtree(
                 }));
             }
             Op::Len { depth } => {
+                prev_is_macro_call = MacroCallState::None;
                 let length = ctx.nesting.get(ctx.nesting.len() - 1 - depth).map_or(0, |_nest| {
                     // FIXME: to be implemented
                     0
@@ -241,6 +295,7 @@ fn expand_subtree(
                 }));
             }
             Op::Count { name, depth } => {
+                prev_is_macro_call = MacroCallState::None;
                 let mut binding = match ctx.bindings.get(name, ctx.call_site) {
                     Ok(b) => b,
                     Err(e) => {
@@ -285,6 +340,7 @@ fn expand_subtree(
                 }));
             }
             Op::Concat { elements, span: concat_span } => {
+                prev_is_macro_call = MacroCallState::None;
                 let mut concatenated = String::new();
                 for element in elements {
                     match element {
@@ -383,12 +439,13 @@ fn expand_var(
     id: Span,
     builder: &mut tt::TopSubtreeBuilder,
     marker: impl Fn(&mut Span) + Copy,
-) -> ExpandResult<()> {
+) -> ExpandResult<bool> {
     // We already handle $crate case in mbe parser
     debug_assert!(*v != sym::crate_);
 
     match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
         Ok(fragment) => {
+            let is_path = matches!(fragment, Fragment::Path(_));
             match fragment {
                 // rustc spacing is not like ours. Ours is like proc macros', it dictates how puncts will actually be joined.
                 // rustc uses them mostly for pretty printing. So we have to deviate a bit from what rustc does here.
@@ -418,11 +475,20 @@ fn expand_var(
                         ])
                     );
 
+                    // Parenthesize for precedence when the fragment spans multiple
+                    // tokens, or — when fed to a nested macro invocation — also when
+                    // it is a single token, so that the invoked macro's matcher sees
+                    // it as one opaque token tree instead of a plain token. See
+                    // `ExpandCtx::in_macro_args`.
                     let wrap_in_parens = !is_negative_literal
-                        && !matches!(sub.iter().collect_array(), Some([tt::TtElement::Leaf(_)]))
                         && sub.try_into_subtree().is_none_or(|it| {
                             it.top_subtree().delimiter.kind == tt::DelimiterKind::Invisible
-                        });
+                        })
+                        && (ctx.in_macro_args
+                            || !matches!(
+                                sub.iter().collect_array(),
+                                Some([tt::TtElement::Leaf(_)])
+                            ));
                     if wrap_in_parens {
                         builder.open(tt::DelimiterKind::Parenthesis, span);
                     }
@@ -434,7 +500,7 @@ fn expand_var(
                 Fragment::Path(tt) => fix_up_and_push_path_tt(ctx, builder, tt),
                 Fragment::Empty => (),
             };
-            ExpandResult::ok(())
+            ExpandResult::ok(is_path)
         }
         Err(e) if matches!(e.inner.1, ExpandErrorKind::UnresolvedBinding(_)) => {
             // Note that it is possible to have a `$var` inside a macro which is not bound.
@@ -454,9 +520,9 @@ fn expand_var(
                 tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span: id }),
                 tt::Leaf::from(tt::Ident { sym: v.clone(), span: id, kind: tt::IdentKind::Normal }),
             ]);
-            ExpandResult::ok(())
+            ExpandResult::ok(false)
         }
-        Err(e) => ExpandResult::only_err(e),
+        Err(e) => ExpandResult::only_err(e).map(|()| false),
     }
 }
 

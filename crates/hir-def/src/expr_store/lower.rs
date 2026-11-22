@@ -3478,6 +3478,10 @@ impl<'db> ExprCollector<'db> {
                     _ => None,
                 };
             }
+            // Parenthesized expressions are transparent, unwrap them. This also
+            // unwraps the parenthesis `mbe` uses to keep `expr` metavariables
+            // passed to macro invocations opaque (see `mbe`'s transcriber).
+            ast::Expr::ParenExpr(paren) => return self.expand_macros_to_string(paren.expr()?),
             _ => return None,
         };
         let e = m.macro_call()?;

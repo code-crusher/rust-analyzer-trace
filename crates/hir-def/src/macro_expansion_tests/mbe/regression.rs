@@ -1205,3 +1205,41 @@ fn foo() {
 "#]],
     );
 }
+
+#[test]
+fn regression_22877() {
+    // `$x:expr` fragments fed to a nested macro invocation must stay opaque:
+    // `rustc` keeps them as interpolated tokens that only match `tt`-like
+    // metavariables, never plain token patterns. Here `inner!` relies on that
+    // to distinguish its own literal `0` from user-provided bits, like bitvec's
+    // `__encode_bits!` does (https://github.com/rust-lang/rust-analyzer/issues/22877).
+    // Without the opacity, `$(0,)*` would swallow the user's `0`, matching the
+    // first arm and producing `[0; 0]` instead of `[0; 1]`.
+    check(
+        r#"
+macro_rules! inner {
+    ($(0,)*; $store:ident, $ord:ident) => { [0; 0] };
+    ($($bits:tt),*; $store:ident, $ord:ident) => { [0; 1] };
+}
+macro_rules! outer {
+    ($store:ident, $ord:ident; $($val:expr),* $(,)?) => {
+        inner!($($val,)*; $store, $ord)
+    };
+}
+const DATA: [u8; 1] = outer!(u8, Lsb0; 0);
+"#,
+        expect![[r#"
+macro_rules! inner {
+    ($(0,)*; $store:ident, $ord:ident) => { [0; 0] };
+    ($($bits:tt),*; $store:ident, $ord:ident) => { [0; 1] };
+}
+macro_rules! outer {
+    ($store:ident, $ord:ident; $($val:expr),* $(,)?) => {
+        inner!($($val,)*; $store, $ord)
+    };
+}
+const DATA: [u8; 1] = inner!((0), ;
+u8, Lsb0);
+"#]],
+    );
+}

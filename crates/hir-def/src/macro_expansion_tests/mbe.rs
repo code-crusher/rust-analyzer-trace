@@ -1950,7 +1950,7 @@ macro_rules! r#try {
     };
 }
 fn f() {
-    try!(0);
+    try!((0));
 }
 "#]],
     );
@@ -2022,7 +2022,7 @@ macro_rules! m {
     ($($x:expr)'a*) => (stringify!($($x)'b*));
 }
 fn f() {
-    let _ = stringify!(0 'b 1 'b 2);
+    let _ = stringify!((0)'b(1)'b(2));
 }
     "#]],
     );
